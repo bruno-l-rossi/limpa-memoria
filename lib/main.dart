@@ -1,12 +1,16 @@
+import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:photo_manager/photo_manager.dart';
-import 'dart:io';
 import 'package:video_player/video_player.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:googleapis/drive/v3.dart' as drive;
 import 'package:google_fonts/google_fonts.dart';
 import 'package:extension_google_sign_in_as_googleapis_auth/extension_google_sign_in_as_googleapis_auth.dart';
+import 'package:background_downloader/background_downloader.dart';
+import 'upload_store.dart';
+import 'backup_service.dart';
 
 void main() => runApp(const MyApp());
 
@@ -100,7 +104,14 @@ class _HomePageState extends State<HomePage> {
   );
   GoogleSignInAccount? _conta;
 
-  final Set<MediaItem> _enviados = {};
+  // Backup em segundo plano.
+  final UploadStore _store = UploadStore();
+  Set<String> _enviadosIds = {}; // ids já confirmados no Drive
+  final Set<String> _emFila = {}; // ids deste backup (pra contar progresso)
+  StreamSubscription<TaskUpdate>? _sub;
+
+  int get _bgTotal => _emFila.length;
+  int get _bgFeitos => _emFila.where(_enviadosIds.contains).length;
 
   Widget _barraAcoes() {
     return Padding(
@@ -184,159 +195,74 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  Future<String> _acharOuCriarPasta(
-      drive.DriveApi api, String nome, String? parentId) async {
-    final nomeEsc = nome.replaceAll("'", r"\'");
-    var q =
-        "mimeType='application/vnd.google-apps.folder' and name='$nomeEsc' and trashed=false";
-    if (parentId != null) q += " and '$parentId' in parents";
-    final res = await api.files.list(q: q, $fields: 'files(id,name)');
-    if (res.files != null && res.files!.isNotEmpty) {
-      return res.files!.first.id!;
-    }
-    final nova = drive.File()
-      ..name = nome
-      ..mimeType = 'application/vnd.google-apps.folder';
-    if (parentId != null) nova.parents = [parentId];
-    final criada = await api.files.create(nova);
-    return criada.id!;
-  }
-
   Future<void> _subir() async {
     if (_conta == null) {
       ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Entre com o Google primeiro.')));
       return;
     }
-    final client = await _gsi.authenticatedClient();
-    if (client == null) return;
-    final api = drive.DriveApi(client);
 
-    final about = await api.about.get($fields: 'storageQuota');
-    final usado = int.tryParse(about.storageQuota?.usage ?? '0') ?? 0;
-    final limite = int.tryParse(about.storageQuota?.limit ?? '0') ?? 0;
-    final livre = limite == 0 ? null : limite - usado;
-    if (livre != null && _totalSelecionado > livre) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(
-              'Não cabe. Precisa de ${_fmt(_totalSelecionado)}, livre ${_fmt(livre)}.')));
+    // Só o que ainda não subiu (não re-sobe o que já está no Drive).
+    final aSubir = _selected.where((m) => !_enviadosIds.contains(m.asset.id));
+    final itens = aSubir
+        .map((m) => ItemBackup(m.asset.id, m.asset.title ?? 'sem nome', m.pasta))
+        .toList();
+    if (itens.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Tudo que você marcou já está no Drive.')));
       return;
     }
 
-    final selecionados = _selected.toList();
-    final List<MediaItem> ok = [];
-    final List<String> falhas = [];
-    final progresso = ValueNotifier<double>(0);
-    final textoProg = ValueNotifier<String>('Preparando...');
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => AlertDialog(
-        title: const Text('Subindo para o Drive'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ValueListenableBuilder<String>(
-              valueListenable: textoProg,
-              builder: (_, t, __) => Text(t),
-            ),
-            const SizedBox(height: 16),
-            ValueListenableBuilder<double>(
-              valueListenable: progresso,
-              builder: (_, p, __) => LinearProgressIndicator(value: p),
-            ),
-          ],
-        ),
-      ),
-    );
-
-    try {
-      final mainId = await _acharOuCriarPasta(api, 'Limpa Memória', null);
-      final Map<String, String> subCache = {};
-      for (var i = 0; i < selecionados.length; i++) {
-        final item = selecionados[i];
-        textoProg.value = 'Subindo ${i + 1} de ${selecionados.length}...';
-        try {
-          var subId = subCache[item.pasta];
-          if (subId == null) {
-            subId = await _acharOuCriarPasta(api, item.pasta, mainId);
-            subCache[item.pasta] = subId;
-          }
-          final f = await item.asset.file;
-          if (f == null) {
-            falhas.add(item.asset.title ?? 'sem nome');
-          } else {
-            final media = drive.Media(f.openRead(), await f.length());
-            final meta = drive.File()
-              ..name = item.asset.title
-              ..parents = [subId];
-            await api.files.create(meta, uploadMedia: media);
-            ok.add(item);
-          }
-        } catch (e) {
-          falhas.add(item.asset.title ?? 'sem nome');
-        }
-        progresso.value = (i + 1) / selecionados.length;
-      }
-    } finally {
-      _enviados.addAll(ok);
-      if (mounted) Navigator.of(context).pop();
-      setState(() {});
+    // Checa espaço (some os bytes do que ainda falta subir).
+    final livre = await BackupService.espacoLivre(_gsi);
+    final precisa = _selected
+        .where((m) => !_enviadosIds.contains(m.asset.id))
+        .fold<int>(0, (s, m) => s + m.bytes);
+    if (livre != null && precisa > livre) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(
+              'Não cabe. Precisa de ${_fmt(precisa)}, livre ${_fmt(livre)}.')));
+      return;
     }
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text(
+              'Preparando o backup... pode deixar rodando em segundo plano.')));
+    }
+
+    await _store.salvarJob(itens.map((e) => e.toMap()).toList());
+    final (enfileirados, falhas) =
+        await BackupService.enfileirar(gsi: _gsi, itens: itens);
 
     if (!mounted) return;
-    if (ok.isNotEmpty) {
-      showDialog(
-        context: context,
-        builder: (_) => AlertDialog(
-          title: const Text('Backup concluído'),
-          content: Text(
-              '${ok.length} de ${selecionados.length} arquivos salvos no Drive na pasta Limpa Memória. Apagar do celular para liberar espaço?'
-              '${falhas.isEmpty ? '' : '\n\nFalharam: ${falhas.join(', ')}'}'),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('Agora não')),
-            FilledButton(
-                onPressed: () {
-                  Navigator.pop(context);
-                  _apagarEnviados();
-                },
-                child: const Text('Apagar do celular')),
-          ],
-        ),
-      );
-    } else {
-      showDialog(
-        context: context,
-        builder: (_) => AlertDialog(
-          title: const Text('Nada subiu'),
-          content: Text('Falharam: ${falhas.join(', ')}'),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('OK')),
-          ],
-        ),
-      );
-    }
+    setState(() => _emFila.addAll(enfileirados));
+
+    final msg = falhas.isEmpty
+        ? 'Backup começou: ${enfileirados.length} arquivos. Pode fechar o app, ele continua sozinho.'
+        : 'Backup começou: ${enfileirados.length} arquivos. ${falhas.length} não deu pra preparar.';
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(msg)));
   }
 
   Future<void> _apagarEnviados() async {
-    if (_enviados.isEmpty) {
+    // Só apaga do celular o que está confirmado no Drive E ainda na lista.
+    final idsNoCelular = _items.map((m) => m.asset.id).toSet();
+    final ids = _enviadosIds.where(idsNoCelular.contains).toList();
+    if (ids.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content: Text('Nada confirmado no Drive. Suba antes de apagar.')));
       return;
     }
-    final lista = _enviados.toList();
-    final ids = lista.map((m) => m.asset.id).toList();
     final apagados = await PhotoManager.editor.deleteWithIds(ids);
     final setApagados = apagados.toSet();
+    await _store.esquecerEnviados(setApagados);
     setState(() {
       _items.removeWhere((m) => setApagados.contains(m.asset.id));
-      _enviados.removeWhere((m) => setApagados.contains(m.asset.id));
+      _enviadosIds.removeAll(setApagados);
       _selected.removeWhere((m) => setApagados.contains(m.asset.id));
+      _emFila.removeAll(setApagados);
       final Map<String, List<MediaItem>> grupos = {};
       for (final it in _items) {
         grupos.putIfAbsent(it.pasta, () => []).add(it);
@@ -353,7 +279,47 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    _iniciarBackupEngine();
     _load();
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _iniciarBackupEngine() async {
+    await BackupService.init();
+    // Quem já subiu antes (sobrevive a fechar o app / reiniciar o celular).
+    final enviados = await _store.enviados();
+    // Reconstrói a contagem do backup que ficou pela metade.
+    final job = await _store.job();
+    if (mounted) {
+      setState(() {
+        _enviadosIds = enviados;
+        if (job.isNotEmpty) {
+          _emFila
+            ..clear()
+            ..addAll(job.map((m) => m['id'] ?? ''));
+        }
+      });
+    }
+    // Cada arquivo que termina em segundo plano cai aqui, mesmo com a tela
+    // apagada. É o que faz o progresso continuar sozinho ao reabrir.
+    _sub = FileDownloader().updates.listen((update) async {
+      if (update is TaskStatusUpdate &&
+          update.task.group == BackupService.grupo) {
+        if (update.status == TaskStatus.complete) {
+          final id = update.task.taskId;
+          await _store.marcarEnviado(id);
+          if (mounted) setState(() => _enviadosIds.add(id));
+        } else if (mounted) {
+          // pausado, falhou, etc: só atualiza a tela.
+          setState(() {});
+        }
+      }
+    });
   }
 
   Future<void> _load() async {
@@ -469,22 +435,6 @@ class _HomePageState extends State<HomePage> {
         }
       });
 
-  void _continuar() {
-    final nomes = _selected.map((m) => m.asset.title ?? 'sem nome').join('\n');
-    showDialog(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: Text('${_selected.length} arquivos, ${_fmt(_totalSelecionado)}'),
-        content: Text(nomes.isEmpty ? 'Nada marcado.' : nomes),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('OK')),
-        ],
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
@@ -514,7 +464,7 @@ class _HomePageState extends State<HomePage> {
             IconButton(
               icon: const Icon(Icons.delete_outline),
               tooltip: 'Apagar do celular (so os que ja subiram)',
-              onPressed: _enviados.isEmpty ? null : _apagarEnviados,
+              onPressed: _enviadosIds.isEmpty ? null : _apagarEnviados,
             ),
           ],
         ),
@@ -548,6 +498,7 @@ class _HomePageState extends State<HomePage> {
                       child: Text('Todas as mídias lidas com sucesso',
                           style: TextStyle(color: _inkMuted, fontSize: 14)),
                     ),
+                  _bannerBackup(),
                   Expanded(
                     child: TabBarView(children: [_abaMidias(), _abaPastas()]),
                   ),
@@ -581,6 +532,54 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  Widget _bannerBackup() {
+    if (_emFila.isEmpty) return const SizedBox.shrink();
+    final total = _bgTotal;
+    final feitos = _bgFeitos;
+    final pronto = feitos >= total;
+    final pct = total == 0 ? 0.0 : feitos / total;
+    return Container(
+      width: double.infinity,
+      color: _parchment,
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(pronto ? Icons.cloud_done : Icons.cloud_upload,
+                  size: 18, color: _actionBlue),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  pronto
+                      ? 'Backup concluído: $feitos arquivos no Drive'
+                      : 'Subindo backup: $feitos de $total',
+                  style: const TextStyle(fontSize: 14, color: _ink),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              minHeight: 6,
+              backgroundColor: _hairline,
+              value: pct,
+            ),
+          ),
+          if (!pronto)
+            const Padding(
+              padding: EdgeInsets.only(top: 6),
+              child: Text('Pode fechar o app, ele continua sozinho.',
+                  style: TextStyle(fontSize: 12, color: _inkMuted)),
+            ),
+        ],
+      ),
+    );
+  }
+
   Widget _abaMidias() {
     final lista = _itensOrdenados;
     return Column(
@@ -592,15 +591,26 @@ class _HomePageState extends State<HomePage> {
             itemBuilder: (context, i) {
               final item = lista[i];
               final isVideo = item.asset.type == AssetType.video;
+              final jaSubiu = _enviadosIds.contains(item.asset.id);
               return ListTile(
                 onTap: () => Navigator.push(context,
                     MaterialPageRoute(builder: (_) => PreviewPage(item.asset))),
                 leading: _Miniatura(asset: item.asset, isVideo: isVideo),
                 title: Text(item.asset.title ?? 'sem nome'),
-                subtitle: Text('${item.pasta} • ${_fmt(item.bytes)}'),
-                trailing: Checkbox(
-                    value: _selected.contains(item),
-                    onChanged: (v) => _toggle(item, v)),
+                subtitle: Text(jaSubiu
+                    ? '${item.pasta} • ${_fmt(item.bytes)} • no Drive'
+                    : '${item.pasta} • ${_fmt(item.bytes)}'),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (jaSubiu)
+                      const Icon(Icons.cloud_done,
+                          size: 18, color: _actionBlue),
+                    Checkbox(
+                        value: _selected.contains(item),
+                        onChanged: (v) => _toggle(item, v)),
+                  ],
+                ),
               );
             },
           ),

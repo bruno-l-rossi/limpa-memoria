@@ -40,6 +40,10 @@ dependencies:
   googleapis: ^16.0.0
   extension_google_sign_in_as_googleapis_auth: ^2.0.13
   google_fonts: ^8.1.0
+  # Backup em segundo plano + retomada de progresso
+  background_downloader: ^9.5.5
+  shared_preferences: ^2.3.2
+  http: ^1.2.2
 
 dev_dependencies:
   flutter_test:
