@@ -68,4 +68,17 @@ class UploadStore {
     final p = await SharedPreferences.getInstance();
     await p.remove(_kJob);
   }
+
+  /// Migração única: limpa a fila herdada das builds antigas só uma vez.
+  static const _kMigrouJanela = 'migrou_janela_v1';
+
+  Future<bool> precisaLimparFila() async {
+    final p = await SharedPreferences.getInstance();
+    return !(p.getBool(_kMigrouJanela) ?? false);
+  }
+
+  Future<void> marcarFilaLimpa() async {
+    final p = await SharedPreferences.getInstance();
+    await p.setBool(_kMigrouJanela, true);
+  }
 }

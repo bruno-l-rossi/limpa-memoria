@@ -107,13 +107,53 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // Backup em segundo plano.
   final UploadStore _store = UploadStore();
   Set<String> _enviadosIds = {}; // ids já confirmados no Drive
-  final Set<String> _emFila = {}; // ids deste backup (pra contar progresso)
+  final Set<String> _emFila = {}; // todos os ids deste backup (total da barra)
   int _falhasBg = 0; // uploads que falharam de vez
   String? _erroBg; // último motivo de erro, pra mostrar na tela
   StreamSubscription<TaskUpdate>? _sub;
 
+  // Janela deslizante: poucos uploads ativos por vez, repondo conforme terminam.
+  static const int _janela = 12; // máximo de uploads simultâneos
+  final List<ItemBackup> _pendentes = []; // ainda não enfileirados
+  final Set<String> _emAndamento = {}; // ids enfileirados/subindo agora
+  final Map<String, int> _tentativas = {}; // re-tentativas por id
+  bool _alimentando = false; // trava de reentrância
+
   int get _bgTotal => _emFila.length;
   int get _bgFeitos => _emFila.where(_enviadosIds.contains).length;
+
+  /// Repõe a janela: enfileira o próximo pendente até ter _janela ativos.
+  Future<void> _alimentarFila() async {
+    if (_alimentando) return;
+    _alimentando = true;
+    try {
+      while (_emAndamento.length < _janela && _pendentes.isNotEmpty) {
+        final item = _pendentes.removeAt(0);
+        if (_enviadosIds.contains(item.id) || _emAndamento.contains(item.id)) {
+          continue; // já subiu ou já está na fila
+        }
+        _emAndamento.add(item.id);
+        if (mounted) setState(() {});
+        final (ok, erro) = await BackupService.enfileirarUm(_gsi, item);
+        if (!ok) {
+          _emAndamento.remove(item.id);
+          final t = (_tentativas[item.id] ?? 0) + 1;
+          _tentativas[item.id] = t;
+          if (t <= 3) {
+            _pendentes.add(item); // volta pro fim da fila
+          } else if (mounted) {
+            setState(() {
+              _falhasBg++;
+              if (erro != null && erro.isNotEmpty) _erroBg = erro;
+            });
+          }
+        }
+        if (mounted) setState(() {});
+      }
+    } finally {
+      _alimentando = false;
+    }
+  }
 
   Widget _barraAcoes() {
     return Padding(
@@ -228,43 +268,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return;
     }
 
-    if (mounted) {
-      setState(() {
-        _falhasBg = 0;
-        _erroBg = null;
-        // Total estável desde já: todos os selecionados, não só os já enfileirados.
-        _emFila.addAll(itens.map((e) => e.id));
-      });
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text(
-              'Preparando o backup... pode deixar rodando em segundo plano.')));
-    }
-
-    await _store.salvarJob(itens.map((e) => e.toMap()).toList());
-
-    List<String> enfileirados = [];
-    List<String> falhas = [];
-    String? erro;
-    try {
-      (enfileirados, falhas, erro) =
-          await BackupService.enfileirar(gsi: _gsi, itens: itens);
-    } catch (e) {
-      erro = '$e';
-    }
-
-    if (!mounted) return;
-    setState(() {
-      _emFila.addAll(enfileirados);
-      _erroBg = enfileirados.isEmpty ? erro : null;
-    });
-
-    // Nada subiu: mostra o motivo num diálogo (não deixa travado sem explicação).
-    if (enfileirados.isEmpty) {
+    // Prepara o contexto (token + pasta principal) antes de alimentar a janela.
+    final (ok, erroCtx) = await BackupService.prepararContexto(_gsi);
+    if (!ok) {
+      if (!mounted) return;
       showDialog(
         context: context,
         builder: (_) => AlertDialog(
           title: const Text('Não consegui começar o backup'),
-          content: Text(erro ?? 'Nenhum arquivo pôde ser preparado.'),
+          content: Text(erroCtx ?? 'Falha ao preparar o Drive.'),
           actions: [
             TextButton(
                 onPressed: () => Navigator.pop(context),
@@ -275,10 +287,26 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return;
     }
 
-    final msg = falhas.isEmpty
-        ? 'Backup começou: ${enfileirados.length} arquivos. Pode fechar o app, ele continua sozinho.'
-        : 'Backup começou: ${enfileirados.length} arquivos. ${falhas.length} não deu pra preparar.';
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+    await _store.salvarJob(itens.map((e) => e.toMap()).toList());
+
+    if (mounted) {
+      setState(() {
+        _falhasBg = 0;
+        _erroBg = null;
+        _tentativas.clear();
+        // Total estável desde já: todos os selecionados.
+        _emFila.addAll(itens.map((e) => e.id));
+        // Enche a fila de pendentes; a janela vai puxando aos poucos.
+        _pendentes
+          ..clear()
+          ..addAll(itens);
+      });
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text(
+              'Backup começou. Sobe aos poucos, pode fechar o app que continua sozinho.')));
+    }
+
+    _alimentarFila();
   }
 
   Future<void> _apagarEnviados() async {
@@ -345,14 +373,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _sub = FileDownloader().updates.listen(_onUpdate);
     await BackupService.iniciarMotor();
 
-    // Reconcilia com o banco da biblioteca: tudo que consta como concluído (até
-    // o que subiu com o app fechado) entra nos enviados. Mantém a contagem certa
-    // e impede re-subir o que já está no Drive (sem duplicata).
+    // Reconcilia com o banco da biblioteca PRIMEIRO: tudo que consta como
+    // concluído (até o que subiu com o app fechado) entra nos enviados. Mantém a
+    // contagem certa e impede re-subir o que já está no Drive (sem duplicata).
     final concluidos = await BackupService.concluidosNoBanco();
     for (final id in concluidos) {
       await _store.marcarEnviado(id);
     }
     await _store.gravarAgora();
+
+    // Só depois de salvar o que já subiu: limpeza única da fila herdada das
+    // builds antigas (que enfileiravam tudo de uma vez). Roda uma vez por versão.
+    if (await _store.precisaLimparFila()) {
+      await BackupService.limparFilaLegada();
+      await _store.marcarFilaLimpa();
+    }
 
     // Restaura o login da última vez (sem pedir nada), pra poder retomar sozinho.
     try {
@@ -372,9 +407,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         }
       });
     }
-    // Retoma sozinho: re-enfileira o que o job pedia mas ainda não subiu e nem
-    // está na fila (ex.: arquivos que falharam de vez ou se perderam num kill).
-    _retomarPendentes(job);
+    // Retoma sozinho na janela: o que o job pedia, menos o que já subiu e o que
+    // o motor já tem ativo, vira pendente e a janela vai puxando.
+    _retomarJanela(job);
   }
 
   // Cada arquivo que termina em segundo plano cai aqui, mesmo com a tela apagada.
@@ -383,42 +418,67 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         update.task.group != BackupService.grupo) {
       return;
     }
+    final id = update.task.taskId;
     if (update.status == TaskStatus.complete) {
-      final id = update.task.taskId;
       await _store.marcarEnviado(id);
+      _emAndamento.remove(id);
+      _tentativas.remove(id);
       if (mounted) setState(() => _enviadosIds.add(id));
-    } else if (update.status == TaskStatus.failed) {
+      _alimentarFila(); // repõe a janela com o próximo
+    } else if (update.status == TaskStatus.failed ||
+        update.status == TaskStatus.notFound) {
+      _emAndamento.remove(id);
       final desc = update.exception?.description;
-      if (mounted) {
+      final t = (_tentativas[id] ?? 0) + 1;
+      _tentativas[id] = t;
+      if (t <= 3 && _emFila.contains(id) && !_enviadosIds.contains(id)) {
+        // Falhou mesmo depois das retentativas internas: tenta de novo com uma
+        // sessão nova, no fim da fila.
+        _pendentes.add(
+            ItemBackup(id, update.task.filename, update.task.metaData));
+      } else if (mounted) {
         setState(() {
           _falhasBg++;
           if (desc != null && desc.isNotEmpty) _erroBg = desc;
         });
       }
+      if (mounted) setState(() {});
+      _alimentarFila();
     } else if (mounted) {
       setState(() {});
     }
   }
 
-  Future<void> _retomarPendentes(List<Map<String, String>> job) async {
+  Future<void> _retomarJanela(List<Map<String, String>> job) async {
     if (job.isEmpty || _conta == null) return;
     // Espera o motor restaurar a fila nativa antes de decidir o que falta.
     await Future.delayed(const Duration(seconds: 3));
     final enviados = await _store.enviados(); // leitura fresca
-    final ativos = await BackupService.idsAtivos();
+    final ativos = await BackupService.idsAtivos(); // o que o motor já retomou
+    if (!mounted) return;
+    _emAndamento.addAll(ativos.where((id) => !enviados.contains(id)));
     final pendentes = job
         .where((m) {
           final id = m['id'] ?? '';
           return id.isNotEmpty &&
               !enviados.contains(id) &&
-              !ativos.contains(id);
+              !_emAndamento.contains(id);
         })
         .map(ItemBackup.fromMap)
         .toList();
-    if (pendentes.isEmpty || !mounted) return;
-    final (enf, _, _) =
-        await BackupService.enfileirar(gsi: _gsi, itens: pendentes);
-    if (mounted) setState(() => _emFila.addAll(enf));
+    if (pendentes.isEmpty) {
+      if (mounted) setState(() {});
+      return;
+    }
+    final (ok, _) = await BackupService.prepararContexto(_gsi);
+    if (!ok) return;
+    if (!mounted) return;
+    setState(() {
+      _pendentes
+        ..clear()
+        ..addAll(pendentes);
+    });
+    _alimentarFila();
   }
 
   Future<void> _load() async {
@@ -668,11 +728,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               value: pct,
             ),
           ),
-          if (!pronto && _erroBg == null)
-            const Padding(
-              padding: EdgeInsets.only(top: 6),
-              child: Text('Pode fechar o app, ele continua sozinho.',
-                  style: TextStyle(fontSize: 12, color: _inkMuted)),
+          if (!pronto)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                  'Subindo agora: ${_emAndamento.length} · na fila: ${_pendentes.length} · pode fechar o app',
+                  style: const TextStyle(fontSize: 12, color: _inkMuted)),
             ),
           if (_falhasBg > 0 || _erroBg != null)
             Padding(

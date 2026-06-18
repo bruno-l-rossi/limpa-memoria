@@ -18,39 +18,54 @@ class ItemBackup {
       ItemBackup(m['id'] ?? '', m['titulo'] ?? 'sem nome', m['pasta'] ?? 'Outros');
 }
 
-/// Cuida do upload em segundo plano via background_downloader.
+/// Upload em segundo plano via background_downloader, em JANELA DESLIZANTE.
 ///
-/// A ideia: cada arquivo vira uma "sessão retomável" no Google Drive (um POST
-/// rápido em primeiro plano que devolve uma URL de upload). Essa URL vale por
-/// dias e não depende mais do login, então o Android pode subir os arquivos
-/// sozinho, em segundo plano, mesmo com o app fechado, mostrando uma notificação.
+/// Em vez de despejar milhares de tarefas de uma vez no Android (o que engasga o
+/// WorkManager, segura o app criando sessões e estoura o token de 1h), o app
+/// mantém poucos uploads ativos por vez e vai enfileirando o próximo conforme
+/// um termina. Quem controla a janela é o main; aqui ficam as peças: preparar o
+/// contexto (token + pasta) e enfileirar UM arquivo.
 class BackupService {
   static const grupo = 'backup';
 
-  /// Configura notificação e permissão. Chamar no início, ANTES de registrar o
-  /// listener e de ligar o motor.
+  // Contexto da sessão atual de upload (renovado quando o token expira).
+  static drive.DriveApi? _api;
+  static String? _token;
+  static String? _mainId;
+  static final Map<String, String> _subCache = {};
+
+  /// Configura notificação e permissão. Chamar no início, ANTES do listener e
+  /// do iniciarMotor.
   static Future<void> configurar() async {
     FileDownloader().configureNotificationForGroup(
       grupo,
       running: const TaskNotification(
           'Limpa Memória', 'Subindo backup: {numFinished} de {numTotal}'),
-      complete:
-          const TaskNotification('Limpa Memória', 'Backup concluído ✓'),
+      complete: const TaskNotification('Limpa Memória', 'Backup concluído ✓'),
       error: const TaskNotification(
           'Limpa Memória', 'Backup interrompido, reabra o app pra continuar'),
       progressBar: true,
     );
-    // Permissão de notificação (Android 13+); sem isso a barra de progresso em
-    // segundo plano não aparece.
     await FileDownloader().permissions.request(PermissionType.notifications);
   }
 
-  /// Liga o motor. O start() ativa o banco, reprocessa o que terminou em
-  /// segundo plano e reagenda tarefas mortas pelo SO. IMPORTANTE: o listener de
-  /// updates PRECISA já estar registrado antes desta chamada, senão os arquivos
-  /// que concluíram com o app fechado passam batido (era esse o bug da contagem).
+  /// Liga o motor: ativa o banco e reprocessa o que terminou em segundo plano.
+  /// Não usa rescheduleKilledTasks de propósito (ele reviveria os milhares de
+  /// tarefas que as builds antigas despejaram). Quem retoma é a janela do main.
+  /// O listener de updates PRECISA já estar registrado antes desta chamada.
   static Future<void> iniciarMotor() async {
-    await FileDownloader().start();
+    await FileDownloader().trackTasks();
+    await FileDownloader().resumeFromBackground();
+  }
+
+  /// Limpeza única: cancela tudo que está na fila (herança das builds antigas que
+  /// enfileiravam milhares de uma vez). A contagem do que já subiu não se perde,
+  /// porque ela vive no nosso próprio armazenamento e no banco da biblioteca.
+  static Future<void> limparFilaLegada() async {
+    try {
+      // reset cancela todas as tarefas em andamento do grupo.
+      await FileDownloader().reset(group: grupo);
+    } catch (_) {}
   }
 
   /// Fonte da verdade do que já subiu: tudo que o banco da biblioteca marca como
@@ -62,6 +77,117 @@ class BackupService {
         .where((r) => r.task.group == grupo && r.status == TaskStatus.complete)
         .map((r) => r.taskId)
         .toSet();
+  }
+
+  /// Ids que já estão na fila de upload (rodando, esperando ou pra retentar).
+  static Future<Set<String>> idsAtivos() async {
+    final ids = await FileDownloader()
+        .allTaskIds(group: grupo, includeTasksWaitingToRetry: true);
+    return ids.toSet();
+  }
+
+  /// Quanto cabe no Drive. Devolve null se a conta não tem limite definido.
+  static Future<int?> espacoLivre(GoogleSignIn gsi) async {
+    final client = await gsi.authenticatedClient();
+    if (client == null) return null;
+    final api = drive.DriveApi(client);
+    final about = await api.about.get($fields: 'storageQuota');
+    final q = about.storageQuota;
+    final usado = int.tryParse(q?.usage ?? '0') ?? 0;
+    final limite = int.tryParse(q?.limit ?? '0') ?? 0;
+    return limite == 0 ? null : limite - usado;
+  }
+
+  /// Prepara o contexto pra enfileirar: token fresco, cliente do Drive e a pasta
+  /// principal. Chamar antes de começar a alimentar a janela.
+  static Future<(bool, String?)> prepararContexto(GoogleSignIn gsi) async {
+    try {
+      final conta = gsi.currentUser;
+      final client = await gsi.authenticatedClient();
+      if (conta == null || client == null) {
+        return (false, 'Você não está conectado ao Google. Entre de novo.');
+      }
+      _api = drive.DriveApi(client);
+      _token = (await conta.authentication).accessToken;
+      if (_token == null) {
+        return (false, 'Não consegui o token do Google. Saia e entre de novo.');
+      }
+      _mainId = await _acharOuCriarPasta(_api!, 'Limpa Memória', null);
+      _subCache.clear();
+      return (true, null);
+    } catch (e) {
+      return (false, 'Não consegui preparar o Drive: $e');
+    }
+  }
+
+  /// Renova o token (e o cliente) quando o anterior expira no meio de um job longo.
+  static Future<String?> _renovarToken(GoogleSignIn gsi) async {
+    try {
+      final conta = await gsi.signInSilently();
+      final client = await gsi.authenticatedClient();
+      if (client != null) _api = drive.DriveApi(client);
+      _token = (await conta?.authentication)?.accessToken;
+    } catch (_) {}
+    return _token;
+  }
+
+  /// Enfileira UM arquivo: garante a subpasta, abre a sessão retomável e manda
+  /// pro background_downloader. Devolve (ok, erro). Renova o token se ele expirou.
+  static Future<(bool, String?)> enfileirarUm(
+      GoogleSignIn gsi, ItemBackup item) async {
+    try {
+      if (_api == null || _mainId == null || _token == null) {
+        final (ok, err) = await prepararContexto(gsi);
+        if (!ok) return (false, err);
+      }
+
+      var subId = _subCache[item.pasta];
+      if (subId == null) {
+        subId = await _acharOuCriarPasta(_api!, item.pasta, _mainId!);
+        _subCache[item.pasta] = subId;
+      }
+
+      final asset = await AssetEntity.fromId(item.id)
+          .timeout(const Duration(seconds: 30), onTimeout: () => null);
+      final file = await asset?.file
+          .timeout(const Duration(seconds: 60), onTimeout: () => null);
+      if (file == null) {
+        return (false, 'Não consegui abrir "${item.titulo}" a tempo.');
+      }
+
+      var (sessao, erroSessao) = await _criarSessao(_token!, item.titulo, subId);
+      if (sessao == null) {
+        // Pode ser token expirado: renova e tenta de novo uma vez.
+        final novo = await _renovarToken(gsi);
+        if (novo != null) {
+          (sessao, erroSessao) = await _criarSessao(novo, item.titulo, subId);
+        }
+      }
+      if (sessao == null) return (false, erroSessao);
+
+      final (baseDir, directory, filename) =
+          await Task.split(filePath: file.path);
+      final tarefa = UploadTask(
+        taskId: item.id,
+        url: sessao,
+        baseDirectory: baseDir,
+        directory: directory,
+        filename: filename,
+        httpRequestMethod: 'PUT',
+        post: 'binary',
+        headers: const {'Content-Disposition': ''},
+        group: grupo,
+        updates: Updates.statusAndProgress,
+        // Muitas retentativas com espera crescente: sobrevive a quedas curtas de
+        // rede/DNS sem desistir do arquivo.
+        retries: 10,
+        metaData: item.pasta,
+      );
+      final ok = await FileDownloader().enqueue(tarefa);
+      return ok ? (true, null) : (false, 'O Android recusou enfileirar.');
+    } catch (e) {
+      return (false, '$e');
+    }
   }
 
   static Future<String> _acharOuCriarPasta(
@@ -83,7 +209,6 @@ class BackupService {
   }
 
   /// Abre uma sessão de upload retomável no Drive. Devolve (urlDaSessao, erro).
-  /// Se der ruim, urlDaSessao vem null e erro traz o motivo (pra mostrar na tela).
   static Future<(String?, String?)> _criarSessao(
       String token, String nome, String folderId) async {
     try {
@@ -106,131 +231,10 @@ class BackupService {
         if (loc != null && loc.isNotEmpty) return (loc, null);
         return (null, 'Drive não devolveu a URL da sessão (HTTP ${resp.statusCode}).');
       }
+      if (resp.statusCode == 401) return (null, 'token-expirado');
       return (null, 'Drive recusou (HTTP ${resp.statusCode}).');
     } catch (e) {
       return (null, 'Falha de rede ao preparar: $e');
     }
-  }
-
-  /// Ids que já estão na fila de upload (rodando, esperando ou pra retentar).
-  /// Serve pra não enfileirar de novo o que já está em andamento.
-  static Future<Set<String>> idsAtivos() async {
-    final ids = await FileDownloader()
-        .allTaskIds(group: grupo, includeTasksWaitingToRetry: true);
-    return ids.toSet();
-  }
-
-  /// Quanto cabe no Drive. Devolve null se a conta não tem limite definido.
-  static Future<int?> espacoLivre(GoogleSignIn gsi) async {
-    final client = await gsi.authenticatedClient();
-    if (client == null) return null;
-    final api = drive.DriveApi(client);
-    final about = await api.about.get($fields: 'storageQuota');
-    final q = about.storageQuota;
-    final usado = int.tryParse(q?.usage ?? '0') ?? 0;
-    final limite = int.tryParse(q?.limit ?? '0') ?? 0;
-    return limite == 0 ? null : limite - usado;
-  }
-
-  /// Cria as sessões e enfileira os uploads, um a um (o upload do primeiro já
-  /// começa enquanto os outros são preparados). Devolve (enfileirados, falhas, erro).
-  /// `erro` traz o primeiro motivo sistêmico de falha, pra mostrar na tela.
-  static Future<(List<String>, List<String>, String?)> enfileirar({
-    required GoogleSignIn gsi,
-    required List<ItemBackup> itens,
-  }) async {
-    final enfileirados = <String>[];
-    final falhas = <String>[];
-    String? erro;
-
-    final conta = gsi.currentUser;
-    final client = await gsi.authenticatedClient();
-    if (conta == null || client == null) {
-      return (
-        enfileirados,
-        itens.map((e) => e.titulo).toList(),
-        'Você não está conectado ao Google. Entre de novo.'
-      );
-    }
-    final api = drive.DriveApi(client);
-    final token = (await conta.authentication).accessToken;
-    if (token == null) {
-      return (
-        enfileirados,
-        itens.map((e) => e.titulo).toList(),
-        'Não consegui o token do Google. Saia e entre de novo.'
-      );
-    }
-
-    final String mainId;
-    try {
-      mainId = await _acharOuCriarPasta(api, 'Limpa Memória', null);
-    } catch (e) {
-      return (
-        enfileirados,
-        itens.map((e) => e.titulo).toList(),
-        'Não consegui criar a pasta no Drive: $e'
-      );
-    }
-
-    final Map<String, String> subCache = {};
-
-    for (final item in itens) {
-      try {
-        var subId = subCache[item.pasta];
-        if (subId == null) {
-          subId = await _acharOuCriarPasta(api, item.pasta, mainId);
-          subCache[item.pasta] = subId;
-        }
-        final asset = await AssetEntity.fromId(item.id);
-        final file = await asset?.file;
-        if (file == null) {
-          falhas.add(item.titulo);
-          erro ??= 'Não consegui abrir o arquivo "${item.titulo}".';
-          continue;
-        }
-        final (sessao, erroSessao) = await _criarSessao(token, item.titulo, subId);
-        if (sessao == null) {
-          falhas.add(item.titulo);
-          erro ??= erroSessao;
-          continue;
-        }
-        final (baseDir, directory, filename) =
-            await Task.split(filePath: file.path);
-        final tarefa = UploadTask(
-          taskId: item.id,
-          url: sessao,
-          baseDirectory: baseDir,
-          directory: directory,
-          filename: filename,
-          httpRequestMethod: 'PUT',
-          post: 'binary',
-          // Drive não usa esse cabeçalho; string vazia faz o pacote omiti-lo.
-          headers: const {'Content-Disposition': ''},
-          group: grupo,
-          updates: Updates.statusAndProgress,
-          // Muitas retentativas com espera crescente: sobrevive a quedas curtas
-          // de rede/DNS (o "UnknownHostException") sem desistir do arquivo.
-          retries: 10,
-          // Backup grande pede wifi: se o wifi cai, o upload espera ele voltar
-          // em vez de falhar. Sem wifi, nada sobe (é o certo pra dezenas de GB).
-          requiresWiFi: true,
-          metaData: item.pasta,
-        );
-        // Enfileira já: o primeiro upload começa enquanto os outros preparam.
-        final ok = await FileDownloader().enqueue(tarefa);
-        if (ok) {
-          enfileirados.add(item.id);
-        } else {
-          falhas.add(item.titulo);
-          erro ??= 'O Android recusou enfileirar o upload.';
-        }
-      } catch (e) {
-        falhas.add(item.titulo);
-        erro ??= '$e';
-      }
-    }
-
-    return (enfileirados, falhas, erro);
   }
 }
