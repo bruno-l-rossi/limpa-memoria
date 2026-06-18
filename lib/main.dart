@@ -88,7 +88,7 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _loading = true;
   String _status = 'Carregando...';
   List<MediaItem> _items = [];
@@ -108,6 +108,8 @@ class _HomePageState extends State<HomePage> {
   final UploadStore _store = UploadStore();
   Set<String> _enviadosIds = {}; // ids já confirmados no Drive
   final Set<String> _emFila = {}; // ids deste backup (pra contar progresso)
+  int _falhasBg = 0; // uploads que falharam de vez
+  String? _erroBg; // último motivo de erro, pra mostrar na tela
   StreamSubscription<TaskUpdate>? _sub;
 
   int get _bgTotal => _emFila.length;
@@ -227,23 +229,54 @@ class _HomePageState extends State<HomePage> {
     }
 
     if (mounted) {
+      setState(() {
+        _falhasBg = 0;
+        _erroBg = null;
+      });
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content: Text(
               'Preparando o backup... pode deixar rodando em segundo plano.')));
     }
 
     await _store.salvarJob(itens.map((e) => e.toMap()).toList());
-    final (enfileirados, falhas) =
-        await BackupService.enfileirar(gsi: _gsi, itens: itens);
+
+    List<String> enfileirados = [];
+    List<String> falhas = [];
+    String? erro;
+    try {
+      (enfileirados, falhas, erro) =
+          await BackupService.enfileirar(gsi: _gsi, itens: itens);
+    } catch (e) {
+      erro = '$e';
+    }
 
     if (!mounted) return;
-    setState(() => _emFila.addAll(enfileirados));
+    setState(() {
+      _emFila.addAll(enfileirados);
+      _erroBg = enfileirados.isEmpty ? erro : null;
+    });
+
+    // Nada subiu: mostra o motivo num diálogo (não deixa travado sem explicação).
+    if (enfileirados.isEmpty) {
+      showDialog(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text('Não consegui começar o backup'),
+          content: Text(erro ?? 'Nenhum arquivo pôde ser preparado.'),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('OK')),
+          ],
+        ),
+      );
+      return;
+    }
 
     final msg = falhas.isEmpty
         ? 'Backup começou: ${enfileirados.length} arquivos. Pode fechar o app, ele continua sozinho.'
         : 'Backup começou: ${enfileirados.length} arquivos. ${falhas.length} não deu pra preparar.';
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text(msg)));
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
   Future<void> _apagarEnviados() async {
@@ -279,18 +312,36 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _iniciarBackupEngine();
     _load();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _sub?.cancel();
+    _store.gravarAgora();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Indo pro fundo ou fechando: grava o progresso na hora, sem esperar o lote.
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.detached) {
+      _store.gravarAgora();
+    }
   }
 
   Future<void> _iniciarBackupEngine() async {
     await BackupService.init();
+    // Restaura o login da última vez (sem pedir nada), pra poder retomar sozinho.
+    try {
+      final conta = await _gsi.signInSilently();
+      if (conta != null && mounted) setState(() => _conta = conta);
+    } catch (_) {}
     // Quem já subiu antes (sobrevive a fechar o app / reiniciar o celular).
     final enviados = await _store.enviados();
     // Reconstrói a contagem do backup que ficou pela metade.
@@ -305,6 +356,9 @@ class _HomePageState extends State<HomePage> {
         }
       });
     }
+    // Retoma sozinho: re-enfileira o que o job pedia mas ainda não subiu e nem
+    // está na fila (ex.: arquivos que falharam de vez ou se perderam num kill).
+    _retomarPendentes(job);
     // Cada arquivo que termina em segundo plano cai aqui, mesmo com a tela
     // apagada. É o que faz o progresso continuar sozinho ao reabrir.
     _sub = FileDownloader().updates.listen((update) async {
@@ -314,12 +368,40 @@ class _HomePageState extends State<HomePage> {
           final id = update.task.taskId;
           await _store.marcarEnviado(id);
           if (mounted) setState(() => _enviadosIds.add(id));
+        } else if (update.status == TaskStatus.failed) {
+          final desc = update.exception?.description;
+          if (mounted) {
+            setState(() {
+              _falhasBg++;
+              if (desc != null && desc.isNotEmpty) _erroBg = desc;
+            });
+          }
         } else if (mounted) {
-          // pausado, falhou, etc: só atualiza a tela.
           setState(() {});
         }
       }
     });
+  }
+
+  Future<void> _retomarPendentes(List<Map<String, String>> job) async {
+    if (job.isEmpty || _conta == null) return;
+    // Espera o motor restaurar a fila nativa antes de decidir o que falta.
+    await Future.delayed(const Duration(seconds: 3));
+    final enviados = await _store.enviados(); // leitura fresca
+    final ativos = await BackupService.idsAtivos();
+    final pendentes = job
+        .where((m) {
+          final id = m['id'] ?? '';
+          return id.isNotEmpty &&
+              !enviados.contains(id) &&
+              !ativos.contains(id);
+        })
+        .map(ItemBackup.fromMap)
+        .toList();
+    if (pendentes.isEmpty || !mounted) return;
+    final (enf, _, _) =
+        await BackupService.enfileirar(gsi: _gsi, itens: pendentes);
+    if (mounted) setState(() => _emFila.addAll(enf));
   }
 
   Future<void> _load() async {
@@ -569,11 +651,21 @@ class _HomePageState extends State<HomePage> {
               value: pct,
             ),
           ),
-          if (!pronto)
+          if (!pronto && _erroBg == null)
             const Padding(
               padding: EdgeInsets.only(top: 6),
               child: Text('Pode fechar o app, ele continua sozinho.',
                   style: TextStyle(fontSize: 12, color: _inkMuted)),
+            ),
+          if (_falhasBg > 0 || _erroBg != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                _erroBg != null
+                    ? 'Problema: $_erroBg'
+                    : '$_falhasBg arquivo(s) falharam.',
+                style: const TextStyle(fontSize: 12, color: Color(0xFFB00020)),
+              ),
             ),
         ],
       ),

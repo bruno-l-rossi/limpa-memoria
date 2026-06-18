@@ -1,35 +1,50 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// Guarda no próprio celular o que já subiu pro Drive e qual backup está em
 /// andamento. É isso que faz o app continuar de onde parou em vez de recomeçar
 /// do zero quando é fechado, perde sinal ou o celular reinicia.
+///
+/// A lista de enviados fica na memória como fonte da verdade e é gravada em
+/// lote (não a cada arquivo). Isso evita gravações se atropelando quando vários
+/// uploads terminam juntos, que era o que fazia o contador "voltar pro zero".
 class UploadStore {
   static const _kEnviados = 'ids_enviados';
   static const _kJob = 'job_pendente';
 
-  /// Ids dos arquivos (asset.id) que já foram confirmados no Drive.
+  Set<String>? _cache;
+  Timer? _timer;
+
   Future<Set<String>> enviados() async {
+    if (_cache != null) return _cache!;
     final p = await SharedPreferences.getInstance();
-    return (p.getStringList(_kEnviados) ?? const <String>[]).toSet();
+    _cache = (p.getStringList(_kEnviados) ?? const <String>[]).toSet();
+    return _cache!;
   }
 
   Future<void> marcarEnviado(String id) async {
-    final p = await SharedPreferences.getInstance();
-    final lista = p.getStringList(_kEnviados) ?? <String>[];
-    if (!lista.contains(id)) {
-      lista.add(id);
-      await p.setStringList(_kEnviados, lista);
-    }
+    final set = await enviados();
+    if (set.add(id)) _agendarGravacao();
   }
 
-  /// Tira ids da lista de enviados (usado depois de apagar do celular).
-  Future<void> esquecerEnviados(Iterable<String> ids) async {
+  void _agendarGravacao() {
+    _timer?.cancel();
+    _timer = Timer(const Duration(milliseconds: 800), gravarAgora);
+  }
+
+  /// Grava a lista atual no disco. Chamada em lote e quando o app vai pro fundo.
+  Future<void> gravarAgora() async {
+    _timer?.cancel();
+    if (_cache == null) return;
     final p = await SharedPreferences.getInstance();
-    final alvo = ids.toSet();
-    final lista = p.getStringList(_kEnviados) ?? <String>[];
-    lista.removeWhere(alvo.contains);
-    await p.setStringList(_kEnviados, lista);
+    await p.setStringList(_kEnviados, _cache!.toList());
+  }
+
+  Future<void> esquecerEnviados(Iterable<String> ids) async {
+    final set = await enviados();
+    set.removeAll(ids.toSet());
+    await gravarAgora();
   }
 
   /// O backup que o usuário pediu: lista de {id, titulo, pasta}. Serve pra saber

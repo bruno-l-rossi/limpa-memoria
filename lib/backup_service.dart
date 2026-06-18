@@ -67,25 +67,42 @@ class BackupService {
     return criada.id!;
   }
 
-  /// Abre uma sessão de upload retomável no Drive e devolve a URL da sessão.
-  static Future<String?> _criarSessao(
+  /// Abre uma sessão de upload retomável no Drive. Devolve (urlDaSessao, erro).
+  /// Se der ruim, urlDaSessao vem null e erro traz o motivo (pra mostrar na tela).
+  static Future<(String?, String?)> _criarSessao(
       String token, String nome, String folderId) async {
-    final resp = await http.post(
-      Uri.parse(
-          'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id'),
-      headers: {
-        'Authorization': 'Bearer $token',
-        'Content-Type': 'application/json; charset=UTF-8',
-      },
-      body: jsonEncode({
-        'name': nome,
-        'parents': [folderId],
-      }),
-    );
-    if (resp.statusCode >= 200 && resp.statusCode < 300) {
-      return resp.headers['location'];
+    try {
+      final resp = await http
+          .post(
+            Uri.parse(
+                'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id'),
+            headers: {
+              'Authorization': 'Bearer $token',
+              'Content-Type': 'application/json; charset=UTF-8',
+            },
+            body: jsonEncode({
+              'name': nome,
+              'parents': [folderId],
+            }),
+          )
+          .timeout(const Duration(seconds: 30));
+      if (resp.statusCode >= 200 && resp.statusCode < 300) {
+        final loc = resp.headers['location'];
+        if (loc != null && loc.isNotEmpty) return (loc, null);
+        return (null, 'Drive não devolveu a URL da sessão (HTTP ${resp.statusCode}).');
+      }
+      return (null, 'Drive recusou (HTTP ${resp.statusCode}).');
+    } catch (e) {
+      return (null, 'Falha de rede ao preparar: $e');
     }
-    return null;
+  }
+
+  /// Ids que já estão na fila de upload (rodando, esperando ou pra retentar).
+  /// Serve pra não enfileirar de novo o que já está em andamento.
+  static Future<Set<String>> idsAtivos() async {
+    final ids = await FileDownloader()
+        .allTaskIds(group: grupo, includeTasksWaitingToRetry: true);
+    return ids.toSet();
   }
 
   /// Quanto cabe no Drive. Devolve null se a conta não tem limite definido.
@@ -100,29 +117,48 @@ class BackupService {
     return limite == 0 ? null : limite - usado;
   }
 
-  /// Cria as sessões e enfileira os uploads. Devolve (enfileirados, falhas).
-  /// As falhas são arquivos que não deu pra abrir ou pra criar a sessão.
-  static Future<(List<String>, List<String>)> enfileirar({
+  /// Cria as sessões e enfileira os uploads, um a um (o upload do primeiro já
+  /// começa enquanto os outros são preparados). Devolve (enfileirados, falhas, erro).
+  /// `erro` traz o primeiro motivo sistêmico de falha, pra mostrar na tela.
+  static Future<(List<String>, List<String>, String?)> enfileirar({
     required GoogleSignIn gsi,
     required List<ItemBackup> itens,
   }) async {
     final enfileirados = <String>[];
     final falhas = <String>[];
+    String? erro;
 
     final conta = gsi.currentUser;
     final client = await gsi.authenticatedClient();
     if (conta == null || client == null) {
-      return (enfileirados, itens.map((e) => e.titulo).toList());
+      return (
+        enfileirados,
+        itens.map((e) => e.titulo).toList(),
+        'Você não está conectado ao Google. Entre de novo.'
+      );
     }
     final api = drive.DriveApi(client);
     final token = (await conta.authentication).accessToken;
     if (token == null) {
-      return (enfileirados, itens.map((e) => e.titulo).toList());
+      return (
+        enfileirados,
+        itens.map((e) => e.titulo).toList(),
+        'Não consegui o token do Google. Saia e entre de novo.'
+      );
     }
 
-    final mainId = await _acharOuCriarPasta(api, 'Limpa Memória', null);
+    final String mainId;
+    try {
+      mainId = await _acharOuCriarPasta(api, 'Limpa Memória', null);
+    } catch (e) {
+      return (
+        enfileirados,
+        itens.map((e) => e.titulo).toList(),
+        'Não consegui criar a pasta no Drive: $e'
+      );
+    }
+
     final Map<String, String> subCache = {};
-    final tarefas = <UploadTask>[];
 
     for (final item in itens) {
       try {
@@ -135,16 +171,18 @@ class BackupService {
         final file = await asset?.file;
         if (file == null) {
           falhas.add(item.titulo);
+          erro ??= 'Não consegui abrir o arquivo "${item.titulo}".';
           continue;
         }
-        final sessao = await _criarSessao(token, item.titulo, subId);
+        final (sessao, erroSessao) = await _criarSessao(token, item.titulo, subId);
         if (sessao == null) {
           falhas.add(item.titulo);
+          erro ??= erroSessao;
           continue;
         }
         final (baseDir, directory, filename) =
             await Task.split(filePath: file.path);
-        tarefas.add(UploadTask(
+        final tarefa = UploadTask(
           taskId: item.id,
           url: sessao,
           baseDirectory: baseDir,
@@ -156,21 +194,28 @@ class BackupService {
           headers: const {'Content-Disposition': ''},
           group: grupo,
           updates: Updates.statusAndProgress,
-          retries: 3,
-          // prioridade alta = no Android 14+ usa o serviço de transferência
-          // longa, dando mais fôlego pra arquivos grandes (o teto padrão é 9 min).
-          priority: 0,
+          // Muitas retentativas com espera crescente: sobrevive a quedas curtas
+          // de rede/DNS (o "UnknownHostException") sem desistir do arquivo.
+          retries: 10,
+          // Backup grande pede wifi: se o wifi cai, o upload espera ele voltar
+          // em vez de falhar. Sem wifi, nada sobe (é o certo pra dezenas de GB).
+          requiresWiFi: true,
           metaData: item.pasta,
-        ));
-        enfileirados.add(item.id);
-      } catch (_) {
+        );
+        // Enfileira já: o primeiro upload começa enquanto os outros preparam.
+        final ok = await FileDownloader().enqueue(tarefa);
+        if (ok) {
+          enfileirados.add(item.id);
+        } else {
+          falhas.add(item.titulo);
+          erro ??= 'O Android recusou enfileirar o upload.';
+        }
+      } catch (e) {
         falhas.add(item.titulo);
+        erro ??= '$e';
       }
     }
 
-    if (tarefas.isNotEmpty) {
-      await FileDownloader().enqueueAll(tarefas);
-    }
-    return (enfileirados, falhas);
+    return (enfileirados, falhas, erro);
   }
 }
