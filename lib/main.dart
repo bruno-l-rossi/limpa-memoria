@@ -232,6 +232,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       setState(() {
         _falhasBg = 0;
         _erroBg = null;
+        // Total estável desde já: todos os selecionados, não só os já enfileirados.
+        _emFila.addAll(itens.map((e) => e.id));
       });
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content: Text(
@@ -336,15 +338,29 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _iniciarBackupEngine() async {
-    await BackupService.init();
+    await BackupService.configurar();
+    // Listener PRIMEIRO: o iniciarMotor() abaixo reprocessa o que terminou em
+    // segundo plano, e sem o listener no ar a gente perderia essas conclusões
+    // (era a causa da contagem zerando).
+    _sub = FileDownloader().updates.listen(_onUpdate);
+    await BackupService.iniciarMotor();
+
+    // Reconcilia com o banco da biblioteca: tudo que consta como concluído (até
+    // o que subiu com o app fechado) entra nos enviados. Mantém a contagem certa
+    // e impede re-subir o que já está no Drive (sem duplicata).
+    final concluidos = await BackupService.concluidosNoBanco();
+    for (final id in concluidos) {
+      await _store.marcarEnviado(id);
+    }
+    await _store.gravarAgora();
+
     // Restaura o login da última vez (sem pedir nada), pra poder retomar sozinho.
     try {
       final conta = await _gsi.signInSilently();
       if (conta != null && mounted) setState(() => _conta = conta);
     } catch (_) {}
-    // Quem já subiu antes (sobrevive a fechar o app / reiniciar o celular).
+
     final enviados = await _store.enviados();
-    // Reconstrói a contagem do backup que ficou pela metade.
     final job = await _store.job();
     if (mounted) {
       setState(() {
@@ -359,28 +375,29 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     // Retoma sozinho: re-enfileira o que o job pedia mas ainda não subiu e nem
     // está na fila (ex.: arquivos que falharam de vez ou se perderam num kill).
     _retomarPendentes(job);
-    // Cada arquivo que termina em segundo plano cai aqui, mesmo com a tela
-    // apagada. É o que faz o progresso continuar sozinho ao reabrir.
-    _sub = FileDownloader().updates.listen((update) async {
-      if (update is TaskStatusUpdate &&
-          update.task.group == BackupService.grupo) {
-        if (update.status == TaskStatus.complete) {
-          final id = update.task.taskId;
-          await _store.marcarEnviado(id);
-          if (mounted) setState(() => _enviadosIds.add(id));
-        } else if (update.status == TaskStatus.failed) {
-          final desc = update.exception?.description;
-          if (mounted) {
-            setState(() {
-              _falhasBg++;
-              if (desc != null && desc.isNotEmpty) _erroBg = desc;
-            });
-          }
-        } else if (mounted) {
-          setState(() {});
-        }
+  }
+
+  // Cada arquivo que termina em segundo plano cai aqui, mesmo com a tela apagada.
+  void _onUpdate(TaskUpdate update) async {
+    if (update is! TaskStatusUpdate ||
+        update.task.group != BackupService.grupo) {
+      return;
+    }
+    if (update.status == TaskStatus.complete) {
+      final id = update.task.taskId;
+      await _store.marcarEnviado(id);
+      if (mounted) setState(() => _enviadosIds.add(id));
+    } else if (update.status == TaskStatus.failed) {
+      final desc = update.exception?.description;
+      if (mounted) {
+        setState(() {
+          _falhasBg++;
+          if (desc != null && desc.isNotEmpty) _erroBg = desc;
+        });
       }
-    });
+    } else if (mounted) {
+      setState(() {});
+    }
   }
 
   Future<void> _retomarPendentes(List<Map<String, String>> job) async {

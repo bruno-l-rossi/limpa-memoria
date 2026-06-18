@@ -27,8 +27,9 @@ class ItemBackup {
 class BackupService {
   static const grupo = 'backup';
 
-  /// Liga o motor de upload. Chamar uma vez no início do app.
-  static Future<void> init() async {
+  /// Configura notificação e permissão. Chamar no início, ANTES de registrar o
+  /// listener e de ligar o motor.
+  static Future<void> configurar() async {
     FileDownloader().configureNotificationForGroup(
       grupo,
       running: const TaskNotification(
@@ -39,14 +40,28 @@ class BackupService {
           'Limpa Memória', 'Backup interrompido, reabra o app pra continuar'),
       progressBar: true,
     );
-    // Pede permissão de notificação (Android 13+); sem isso a barra de
-    // progresso em segundo plano não aparece.
+    // Permissão de notificação (Android 13+); sem isso a barra de progresso em
+    // segundo plano não aparece.
     await FileDownloader().permissions.request(PermissionType.notifications);
-    // Banco interno do pacote: é o que faz as tarefas voltarem sozinhas depois
-    // que o app é fechado ou o celular reinicia.
-    await FileDownloader().trackTasks();
-    await FileDownloader().resumeFromBackground();
-    FileDownloader().start();
+  }
+
+  /// Liga o motor. O start() ativa o banco, reprocessa o que terminou em
+  /// segundo plano e reagenda tarefas mortas pelo SO. IMPORTANTE: o listener de
+  /// updates PRECISA já estar registrado antes desta chamada, senão os arquivos
+  /// que concluíram com o app fechado passam batido (era esse o bug da contagem).
+  static Future<void> iniciarMotor() async {
+    await FileDownloader().start();
+  }
+
+  /// Fonte da verdade do que já subiu: tudo que o banco da biblioteca marca como
+  /// concluído, inclusive o que terminou com o app fechado. Usado pra reconciliar
+  /// a contagem ao abrir e evitar re-subir (duplicata no Drive).
+  static Future<Set<String>> concluidosNoBanco() async {
+    final records = await FileDownloader().database.allRecords();
+    return records
+        .where((r) => r.task.group == grupo && r.status == TaskStatus.complete)
+        .map((r) => r.taskId)
+        .toSet();
   }
 
   static Future<String> _acharOuCriarPasta(
