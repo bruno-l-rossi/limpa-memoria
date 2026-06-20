@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:photo_manager/photo_manager.dart';
@@ -95,6 +95,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   List<Pasta> _pastas = [];
   final Set<MediaItem> _selected = {};
   String _ordem = 'tamanho'; // 'tamanho' ou 'data'
+  String _filtro = 'todos'; // 'todos' | 'drive' | 'foradrive'
 
   bool _calculando = false;
   int _lidos = 0;
@@ -107,51 +108,96 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // Backup em segundo plano.
   final UploadStore _store = UploadStore();
   Set<String> _enviadosIds = {}; // ids já confirmados no Drive
-  final Set<String> _emFila = {}; // todos os ids deste backup (total da barra)
+  final Set<String> _emFila = {}; // total estável da sessão (denominador da barra)
   int _falhasBg = 0; // uploads que falharam de vez
   String? _erroBg; // último motivo de erro, pra mostrar na tela
+  bool _pausado = false; // backup pausado pelo usuário
   StreamSubscription<TaskUpdate>? _sub;
 
-  // Janela deslizante: poucos uploads ativos por vez, repondo conforme terminam.
-  static const int _janela = 12; // máximo de uploads simultâneos
+  // Janela deslizante guiada pelo banco da biblioteca (a fonte da verdade).
+  static const int _janela = 6; // alguns por vez; preparo agora roda em paralelo
   final List<ItemBackup> _pendentes = []; // ainda não enfileirados
-  final Set<String> _emAndamento = {}; // ids enfileirados/subindo agora
+  final Set<String> _emAndamento = {}; // ativos no motor agora (só pra exibir)
   final Map<String, int> _tentativas = {}; // re-tentativas por id
-  bool _alimentando = false; // trava de reentrância
+  bool _sincronizando = false; // trava de reentrância
+  Timer? _poll; // sincroniza com o banco a cada 15s
 
   int get _bgTotal => _emFila.length;
   int get _bgFeitos => _emFila.where(_enviadosIds.contains).length;
 
-  /// Repõe a janela: enfileira o próximo pendente até ter _janela ativos.
-  Future<void> _alimentarFila() async {
-    if (_alimentando) return;
-    _alimentando = true;
+  /// Pergunta ao banco da biblioteca o que concluiu e o que está ativo, atualiza
+  /// a contagem e repõe a janela. Chamado a cada 15s e quando algo termina. Não
+  /// depende de capturar todo evento ao vivo (que pode se perder num job longo):
+  /// o banco é a fonte da verdade, então a janela nunca congela de vez.
+  ///
+  /// O preparo de cada arquivo (achar pasta, abrir o arquivo, criar a sessão do
+  /// Drive) agora roda em PARALELO numa leva só. Antes era um a um, em fila, e
+  /// esse preparo serial era o gargalo: a banda ficava ociosa esperando o app
+  /// preparar o próximo. Em paralelo a janela enche rápido e a rede trabalha.
+  Future<void> _sincronizarEAlimentar() async {
+    if (_sincronizando || _conta == null || _emFila.isEmpty) return;
+    _sincronizando = true;
     try {
-      while (_emAndamento.length < _janela && _pendentes.isNotEmpty) {
-        final item = _pendentes.removeAt(0);
-        if (_enviadosIds.contains(item.id) || _emAndamento.contains(item.id)) {
-          continue; // já subiu ou já está na fila
+      final anterior = Set<String>.of(_emAndamento);
+      // O que está ativo no motor agora (consulta barata, só os ativos).
+      final ativos = (await BackupService.idsAtivos())
+          .where((id) => !_enviadosIds.contains(id))
+          .toSet();
+      // Quem saiu da janela desde a última vez: confere por id (leitura barata)
+      // se concluiu, e marca. Pega conclusões que o evento ao vivo perdeu.
+      for (final id in anterior.difference(ativos)) {
+        final st = await BackupService.statusDe(id);
+        if (st == TaskStatus.complete && !_enviadosIds.contains(id)) {
+          await _store.marcarEnviado(id);
+          _enviadosIds.add(id);
         }
-        _emAndamento.add(item.id);
-        if (mounted) setState(() {});
-        final (ok, erro) = await BackupService.enfileirarUm(_gsi, item);
-        if (!ok) {
-          _emAndamento.remove(item.id);
-          final t = (_tentativas[item.id] ?? 0) + 1;
-          _tentativas[item.id] = t;
-          if (t <= 3) {
-            _pendentes.add(item); // volta pro fim da fila
-          } else if (mounted) {
-            setState(() {
-              _falhasBg++;
-              if (erro != null && erro.isNotEmpty) _erroBg = erro;
-            });
+      }
+      _emAndamento
+        ..clear()
+        ..addAll(ativos);
+
+      // Pausado: só reconcilia o que terminou; não alimenta mais a janela.
+      if (!_pausado) {
+        final vagas = _janela - _emAndamento.length;
+        final lote = <ItemBackup>[];
+        while (lote.length < vagas && _pendentes.isNotEmpty) {
+          final item = _pendentes.removeAt(0);
+          if (_enviadosIds.contains(item.id) ||
+              _emAndamento.contains(item.id) ||
+              lote.any((e) => e.id == item.id)) {
+            continue;
+          }
+          lote.add(item);
+        }
+        if (lote.isNotEmpty) {
+          // Pré-cria as subpastas da leva ANTES do paralelo, senão dois uploads
+          // da mesma pasta nova criariam a pasta duas vezes no Drive.
+          await BackupService.garantirSubpastas(_gsi, lote.map((e) => e.pasta));
+          final res = await Future.wait(lote.map((item) async {
+            final (ok, erro) = await BackupService.enfileirarUm(_gsi, item);
+            return (item: item, ok: ok, erro: erro);
+          }));
+          for (final r in res) {
+            if (r.ok) {
+              _emAndamento.add(r.item.id);
+            } else {
+              final t = (_tentativas[r.item.id] ?? 0) + 1;
+              _tentativas[r.item.id] = t;
+              if (t <= 3) {
+                _pendentes.add(r.item); // volta pro fim da fila
+              } else {
+                _falhasBg++;
+                if (r.erro != null && r.erro!.isNotEmpty) _erroBg = r.erro;
+              }
+            }
           }
         }
-        if (mounted) setState(() {});
       }
+      if (mounted) setState(() {});
+    } catch (_) {
+      // silencioso: tenta de novo no próximo ciclo de 15s
     } finally {
-      _alimentando = false;
+      _sincronizando = false;
     }
   }
 
@@ -244,22 +290,44 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return;
     }
 
-    // Só o que ainda não subiu (não re-sobe o que já está no Drive).
-    final aSubir = _selected.where((m) => !_enviadosIds.contains(m.asset.id));
-    final itens = aSubir
+    // Os selecionados viram itens. A sessão (job) é MESCLADA, nunca reescrita
+    // menor: é o que faz o total da barra ficar estável do começo ao fim. Antes,
+    // cada toque em Subir salvava só "o que ainda falta", então o denominador
+    // caía (19000 -> 14000 -> 200). Se a sessão anterior já terminou, começa nova.
+    final selecionados = _selected
         .map((m) => ItemBackup(m.asset.id, m.asset.title ?? 'sem nome', m.pasta))
         .toList();
-    if (itens.isEmpty) {
+
+    final jobAtual = await _store.job();
+    final sessaoTerminou =
+        _emFila.isNotEmpty && _emFila.every(_enviadosIds.contains);
+    final Map<String, Map<String, String>> mapa = {};
+    if (!sessaoTerminou) {
+      for (final m in jobAtual) {
+        final id = m['id'] ?? '';
+        if (id.isNotEmpty) mapa[id] = m;
+      }
+    }
+    for (final it in selecionados) {
+      mapa[it.id] = it.toMap();
+    }
+    final mergedItens = mapa.values.map(ItemBackup.fromMap).toList();
+
+    // O que ainda falta subir nesta sessão (não re-sobe o que já está no Drive).
+    final pendentesItens =
+        mergedItens.where((it) => !_enviadosIds.contains(it.id)).toList();
+    if (pendentesItens.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content: Text('Tudo que você marcou já está no Drive.')));
       return;
     }
 
-    // Checa espaço (some os bytes do que ainda falta subir).
-    final livre = await BackupService.espacoLivre(_gsi);
-    final precisa = _selected
-        .where((m) => !_enviadosIds.contains(m.asset.id))
+    // Checa espaço (soma os bytes do que ainda falta subir).
+    final idsPendentes = pendentesItens.map((e) => e.id).toSet();
+    final precisa = _items
+        .where((m) => idsPendentes.contains(m.asset.id))
         .fold<int>(0, (s, m) => s + m.bytes);
+    final livre = await BackupService.espacoLivre(_gsi);
     if (livre != null && precisa > livre) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -287,26 +355,57 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return;
     }
 
-    await _store.salvarJob(itens.map((e) => e.toMap()).toList());
+    await _store.salvarJob(mergedItens.map((e) => e.toMap()).toList());
+    await _store.setPausado(false);
 
     if (mounted) {
       setState(() {
+        _pausado = false;
         _falhasBg = 0;
         _erroBg = null;
         _tentativas.clear();
-        // Total estável desde já: todos os selecionados.
-        _emFila.addAll(itens.map((e) => e.id));
-        // Enche a fila de pendentes; a janela vai puxando aos poucos.
+        // Total estável: todos os itens da sessão (mesclados).
+        _emFila
+          ..clear()
+          ..addAll(mergedItens.map((e) => e.id));
+        // Pendentes = o que falta; a janela vai puxando aos poucos.
         _pendentes
           ..clear()
-          ..addAll(itens);
+          ..addAll(pendentesItens);
       });
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content: Text(
               'Backup começou. Sobe aos poucos, pode fechar o app que continua sozinho.')));
     }
 
-    _alimentarFila();
+    _sincronizarEAlimentar();
+  }
+
+  /// Para o backup: deixa de alimentar a janela (o que já estava subindo termina
+  /// sozinho) e limpa os pendentes. O job fica salvo, então o Retomar reconstrói
+  /// o que falta a partir de job menos enviados, sem re-subir nada (sem duplicata).
+  Future<void> _parar() async {
+    await _store.setPausado(true);
+    if (mounted) {
+      setState(() {
+        _pausado = true;
+        _pendentes.clear();
+      });
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text(
+              'Backup pausado. O que já estava subindo termina; o resto fica guardado pra retomar.')));
+    }
+  }
+
+  Future<void> _retomar() async {
+    await _store.setPausado(false);
+    if (mounted) setState(() => _pausado = false);
+    final job = await _store.job();
+    await _retomarJanela(job);
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Retomando de onde parou.')));
+    }
   }
 
   Future<void> _apagarEnviados() async {
@@ -315,12 +414,53 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final ids = _enviadosIds.where(idsNoCelular.contains).toList();
     if (ids.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Nada confirmado no Drive. Suba antes de apagar.')));
+          content: Text('Nada confirmado no Drive ainda. Suba antes de apagar.')));
       return;
     }
-    final apagados = await PhotoManager.editor.deleteWithIds(ids);
-    final setApagados = apagados.toSet();
+
+    final bytes = _items
+        .where((m) => ids.contains(m.asset.id))
+        .fold<int>(0, (s, m) => s + m.bytes);
+    final confirma = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Apagar do celular'),
+        content: Text(
+            'Apagar ${ids.length} arquivos (${_fmt(bytes)}) que já estão no Drive?\n\nO Android vai pedir confirmação em algumas levas.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancelar')),
+          TextButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Apagar')),
+        ],
+      ),
+    );
+    if (confirma != true) return;
+
+    // Apaga em LOTES. Mandar milhares de ids de uma vez estoura o limite do
+    // Android (TransactionTooLargeException) e o clique não fazia nada. Em lotes
+    // de 800 cada chamada cabe; o Android pede confirmação por lote.
+    const tamLote = 800;
+    final List<String> apagadosAll = [];
+    for (var i = 0; i < ids.length; i += tamLote) {
+      final chunk = ids.sublist(i, min(i + tamLote, ids.length));
+      try {
+        final apag = await PhotoManager.editor.deleteWithIds(chunk);
+        apagadosAll.addAll(apag);
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              content: Text('Parou em ${apagadosAll.length} apagados: $e')));
+        }
+        break;
+      }
+    }
+
+    final setApagados = apagadosAll.toSet();
     await _store.esquecerEnviados(setApagados);
+    if (!mounted) return;
     setState(() {
       _items.removeWhere((m) => setApagados.contains(m.asset.id));
       _enviadosIds.removeAll(setApagados);
@@ -333,10 +473,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _pastas = grupos.entries.map((e) => Pasta(e.key, e.value)).toList()
         ..sort((a, b) => b.bytes.compareTo(a.bytes));
     });
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('Apagados ${apagados.length} do celular.')));
-    }
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Apagados ${setApagados.length} do celular.')));
   }
 
   @override
@@ -345,11 +483,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _iniciarBackupEngine();
     _load();
+    // Rede de segurança: a cada 15s sincroniza com o banco e repõe a janela,
+    // mesmo que algum evento ao vivo tenha se perdido.
+    _poll = Timer.periodic(
+        const Duration(seconds: 15), (_) => _sincronizarEAlimentar());
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _poll?.cancel();
     _sub?.cancel();
     _store.gravarAgora();
     super.dispose();
@@ -397,9 +540,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
     final enviados = await _store.enviados();
     final job = await _store.job();
+    final pausado = await _store.pausado();
     if (mounted) {
       setState(() {
         _enviadosIds = enviados;
+        _pausado = pausado;
         if (job.isNotEmpty) {
           _emFila
             ..clear()
@@ -407,12 +552,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         }
       });
     }
-    // Retoma sozinho na janela: o que o job pedia, menos o que já subiu e o que
-    // o motor já tem ativo, vira pendente e a janela vai puxando.
+    // Retoma sozinho na janela (a não ser que o usuário tenha deixado pausado):
+    // o que o job pedia, menos o que já subiu, vira pendente e a janela puxa.
     _retomarJanela(job);
   }
 
-  // Cada arquivo que termina em segundo plano cai aqui, mesmo com a tela apagada.
+  // Resposta rápida a um evento ao vivo. A contagem e a janela de verdade são
+  // mantidas pelo _sincronizarEAlimentar (banco da biblioteca), que é a rede de
+  // segurança caso algum evento se perca.
   void _onUpdate(TaskUpdate update) async {
     if (update is! TaskStatusUpdate ||
         update.task.group != BackupService.grupo) {
@@ -421,17 +568,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final id = update.task.taskId;
     if (update.status == TaskStatus.complete) {
       await _store.marcarEnviado(id);
-      _emAndamento.remove(id);
-      _tentativas.remove(id);
       if (mounted) setState(() => _enviadosIds.add(id));
-      _alimentarFila(); // repõe a janela com o próximo
+      _sincronizarEAlimentar();
     } else if (update.status == TaskStatus.failed ||
         update.status == TaskStatus.notFound) {
-      _emAndamento.remove(id);
-      final desc = update.exception?.description;
       final t = (_tentativas[id] ?? 0) + 1;
       _tentativas[id] = t;
-      if (t <= 3 && _emFila.contains(id) && !_enviadosIds.contains(id)) {
+      if (!_pausado &&
+          t <= 3 &&
+          _emFila.contains(id) &&
+          !_enviadosIds.contains(id)) {
         // Falhou mesmo depois das retentativas internas: tenta de novo com uma
         // sessão nova, no fim da fila.
         _pendentes.add(
@@ -439,37 +585,27 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       } else if (mounted) {
         setState(() {
           _falhasBg++;
+          final desc = update.exception?.description;
           if (desc != null && desc.isNotEmpty) _erroBg = desc;
         });
       }
-      if (mounted) setState(() {});
-      _alimentarFila();
-    } else if (mounted) {
-      setState(() {});
+      _sincronizarEAlimentar();
     }
   }
 
   Future<void> _retomarJanela(List<Map<String, String>> job) async {
-    if (job.isEmpty || _conta == null) return;
+    if (job.isEmpty || _conta == null || _pausado) return;
     // Espera o motor restaurar a fila nativa antes de decidir o que falta.
     await Future.delayed(const Duration(seconds: 3));
     final enviados = await _store.enviados(); // leitura fresca
-    final ativos = await BackupService.idsAtivos(); // o que o motor já retomou
-    if (!mounted) return;
-    _emAndamento.addAll(ativos.where((id) => !enviados.contains(id)));
     final pendentes = job
         .where((m) {
           final id = m['id'] ?? '';
-          return id.isNotEmpty &&
-              !enviados.contains(id) &&
-              !_emAndamento.contains(id);
+          return id.isNotEmpty && !enviados.contains(id);
         })
         .map(ItemBackup.fromMap)
         .toList();
-    if (pendentes.isEmpty) {
-      if (mounted) setState(() {});
-      return;
-    }
+    if (!mounted) return;
     final (ok, _) = await BackupService.prepararContexto(_gsi);
     if (!ok) return;
     if (!mounted) return;
@@ -478,7 +614,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ..clear()
         ..addAll(pendentes);
     });
-    _alimentarFila();
+    // O sync pula sozinho os que já estão ativos no motor (não duplica).
+    _sincronizarEAlimentar();
   }
 
   Future<void> _load() async {
@@ -507,34 +644,56 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final List<MediaItem> items = [
       for (final a in assets) MediaItem(a, 0, _nomePasta(a))
     ];
+    // Aplica os tamanhos já em cache: o que a gente leu antes não é lido de novo.
+    final cache = await _store.tamanhos();
+    for (final it in items) {
+      final c = cache[it.asset.id];
+      if (c != null) it.bytes = c;
+    }
     final Map<String, List<MediaItem>> grupos = {};
     for (final it in items) {
       grupos.putIfAbsent(it.pasta, () => []).add(it);
     }
-    final pastas = grupos.entries.map((e) => Pasta(e.key, e.value)).toList();
+    final pastas = grupos.entries.map((e) => Pasta(e.key, e.value)).toList()
+      ..sort((a, b) => b.bytes.compareTo(a.bytes));
+    final faltam = items.where((it) => !cache.containsKey(it.asset.id)).length;
     setState(() {
       _loading = false;
       _items = items;
       _pastas = pastas;
       _status = '${items.length} arquivos';
-      _calculando = true;
-      _lidos = 0;
+      _calculando = faltam > 0;
+      _lidos = items.length - faltam;
     });
-    _calcularTamanhos();
+    if (faltam > 0) _calcularTamanhos();
   }
 
   Future<void> _calcularTamanhos() async {
-    for (var i = 0; i < _items.length; i++) {
+    // Só lê o tamanho do que ainda não está no cache. Num celular com 19 mil
+    // arquivos, as aberturas seguintes ficam quase instantâneas.
+    final cache = await _store.tamanhos();
+    final pendentes =
+        _items.where((it) => !cache.containsKey(it.asset.id)).toList();
+    final base = _items.length - pendentes.length;
+    final novos = <String, int>{};
+    for (var i = 0; i < pendentes.length; i++) {
+      final it = pendentes[i];
       try {
-        final f = await _items[i].asset.file;
-        _items[i].bytes = f != null ? await f.length() : 0;
+        final f = await it.asset.file;
+        it.bytes = f != null ? await f.length() : 0;
       } catch (_) {
-        _items[i].bytes = 0;
+        it.bytes = 0;
       }
-      if (i % 25 == 0 && mounted) {
-        setState(() => _lidos = i + 1);
+      novos[it.asset.id] = it.bytes;
+      if (i % 25 == 0) {
+        if (mounted) setState(() => _lidos = base + i + 1);
+        if (novos.length >= 200) {
+          await _store.salvarTamanhos(novos);
+          novos.clear();
+        }
       }
     }
+    if (novos.isNotEmpty) await _store.salvarTamanhos(novos);
     if (!mounted) return;
     setState(() {
       _lidos = _items.length;
@@ -560,6 +719,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return lista;
   }
 
+  List<MediaItem> get _itensFiltrados {
+    final base = _itensOrdenados;
+    if (_filtro == 'drive') {
+      return base.where((m) => _enviadosIds.contains(m.asset.id)).toList();
+    }
+    if (_filtro == 'foradrive') {
+      return base.where((m) => !_enviadosIds.contains(m.asset.id)).toList();
+    }
+    return base;
+  }
+
   String _fmt(int bytes) {
     if (bytes <= 0) return '0 MB';
     const u = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -572,6 +742,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final txt = i == 0 ? v.toStringAsFixed(0) : v.toStringAsFixed(1);
     return '${txt.replaceAll('.', ',')} ${u[i]}';
   }
+
   int get _totalSelecionado => _selected.fold(0, (s, i) => s + i.bytes);
 
   void _toggle(MediaItem item, bool? v) => setState(() {
@@ -622,7 +793,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             ),
             IconButton(
               icon: const Icon(Icons.delete_outline),
-              tooltip: 'Apagar do celular (so os que ja subiram)',
+              tooltip: 'Apagar do celular (só os que já subiram)',
               onPressed: _enviadosIds.isEmpty ? null : _apagarEnviados,
             ),
           ],
@@ -697,6 +868,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final feitos = _bgFeitos;
     final pronto = feitos >= total;
     final pct = total == 0 ? 0.0 : feitos / total;
+    final faltam = total - feitos;
     return Container(
       width: double.infinity,
       color: _parchment,
@@ -706,17 +878,33 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         children: [
           Row(
             children: [
-              Icon(pronto ? Icons.cloud_done : Icons.cloud_upload,
-                  size: 18, color: _actionBlue),
+              Icon(
+                  pronto
+                      ? Icons.cloud_done
+                      : (_pausado ? Icons.pause_circle : Icons.cloud_upload),
+                  size: 18,
+                  color: _actionBlue),
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
                   pronto
                       ? 'Backup concluído: $feitos arquivos no Drive'
-                      : 'Subindo backup: $feitos de $total',
+                      : (_pausado
+                          ? 'Backup pausado: $feitos de $total'
+                          : 'Subindo backup: $feitos de $total'),
                   style: const TextStyle(fontSize: 14, color: _ink),
                 ),
               ),
+              if (!pronto)
+                _pausado
+                    ? TextButton.icon(
+                        onPressed: _conta == null ? null : _retomar,
+                        icon: const Icon(Icons.play_arrow, size: 18),
+                        label: const Text('Retomar'))
+                    : TextButton.icon(
+                        onPressed: _parar,
+                        icon: const Icon(Icons.stop, size: 18),
+                        label: const Text('Parar')),
             ],
           ),
           const SizedBox(height: 8),
@@ -732,7 +920,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             Padding(
               padding: const EdgeInsets.only(top: 6),
               child: Text(
-                  'Subindo agora: ${_emAndamento.length} · na fila: ${_pendentes.length} · pode fechar o app',
+                  _pausado
+                      ? 'Pausado · faltam $faltam · toque em Retomar pra continuar'
+                      : 'Subindo agora: ${_emAndamento.length} · na fila: ${_pendentes.length} · pode fechar o app',
                   style: const TextStyle(fontSize: 12, color: _inkMuted)),
             ),
           if (_falhasBg > 0 || _erroBg != null)
@@ -750,40 +940,69 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
+  Widget _filtroDrive() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+      child: SizedBox(
+        width: double.infinity,
+        child: SegmentedButton<String>(
+          segments: const [
+            ButtonSegment(value: 'todos', label: Text('Todos')),
+            ButtonSegment(value: 'foradrive', label: Text('Fora')),
+            ButtonSegment(value: 'drive', label: Text('No Drive')),
+          ],
+          selected: {_filtro},
+          showSelectedIcon: false,
+          onSelectionChanged: (s) => setState(() => _filtro = s.first),
+        ),
+      ),
+    );
+  }
+
   Widget _abaMidias() {
-    final lista = _itensOrdenados;
+    final lista = _itensFiltrados;
     return Column(
       children: [
         _barraAcoes(),
+        _filtroDrive(),
         Expanded(
-          child: ListView.builder(
-            itemCount: lista.length,
-            itemBuilder: (context, i) {
-              final item = lista[i];
-              final isVideo = item.asset.type == AssetType.video;
-              final jaSubiu = _enviadosIds.contains(item.asset.id);
-              return ListTile(
-                onTap: () => Navigator.push(context,
-                    MaterialPageRoute(builder: (_) => PreviewPage(item.asset))),
-                leading: _Miniatura(asset: item.asset, isVideo: isVideo),
-                title: Text(item.asset.title ?? 'sem nome'),
-                subtitle: Text(jaSubiu
-                    ? '${item.pasta} • ${_fmt(item.bytes)} • no Drive'
-                    : '${item.pasta} • ${_fmt(item.bytes)}'),
-                trailing: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (jaSubiu)
-                      const Icon(Icons.cloud_done,
-                          size: 18, color: _actionBlue),
-                    Checkbox(
-                        value: _selected.contains(item),
-                        onChanged: (v) => _toggle(item, v)),
-                  ],
+          child: lista.isEmpty
+              ? Center(
+                  child: Text(
+                      _filtro == 'drive'
+                          ? 'Nada no Drive ainda.'
+                          : 'Nada fora do Drive.',
+                      style: const TextStyle(color: _inkMuted)))
+              : ListView.builder(
+                  itemCount: lista.length,
+                  itemBuilder: (context, i) {
+                    final item = lista[i];
+                    final isVideo = item.asset.type == AssetType.video;
+                    final jaSubiu = _enviadosIds.contains(item.asset.id);
+                    return ListTile(
+                      onTap: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                              builder: (_) => PreviewPage(item.asset))),
+                      leading: _Miniatura(asset: item.asset, isVideo: isVideo),
+                      title: Text(item.asset.title ?? 'sem nome'),
+                      subtitle: Text(jaSubiu
+                          ? '${item.pasta} • ${_fmt(item.bytes)} • no Drive'
+                          : '${item.pasta} • ${_fmt(item.bytes)}'),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (jaSubiu)
+                            const Icon(Icons.cloud_done,
+                                size: 18, color: _actionBlue),
+                          Checkbox(
+                              value: _selected.contains(item),
+                              onChanged: (v) => _toggle(item, v)),
+                        ],
+                      ),
+                    );
+                  },
                 ),
-              );
-            },
-          ),
         ),
       ],
     );
@@ -798,12 +1017,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             itemCount: _pastas.length,
             itemBuilder: (context, i) {
               final p = _pastas[i];
+              final subiu =
+                  p.itens.where((it) => _enviadosIds.contains(it.asset.id)).length;
+              final todos = p.itens.length;
+              final tudoNoDrive = todos > 0 && subiu == todos;
               return CheckboxListTile(
                 value: _pastaToda(p),
                 onChanged: (v) => _togglePasta(p, v),
+                secondary: tudoNoDrive
+                    ? const Icon(Icons.cloud_done, color: _actionBlue)
+                    : (subiu > 0
+                        ? Text('$subiu/$todos',
+                            style: const TextStyle(
+                                fontSize: 12, color: _inkMuted))
+                        : null),
                 title: Text(p.nome),
-                subtitle:
-                    Text('${p.itens.length} arquivos • ${_fmt(p.bytes)}'),
+                subtitle: Text(
+                    '${p.itens.length} arquivos • ${_fmt(p.bytes)}${tudoNoDrive ? ' • no Drive' : ''}'),
               );
             },
           ),
@@ -874,12 +1104,22 @@ class _PreviewPageState extends State<PreviewPage> {
         await c.initialize();
         await c.setLooping(true);
         await c.play();
-        if (mounted) setState(() { _video = c; _carregando = false; });
+        if (mounted) {
+          setState(() {
+            _video = c;
+            _carregando = false;
+          });
+        }
         return;
       }
     } else {
       final bytes = await widget.asset.originBytes;
-      if (mounted) setState(() { _imagem = bytes; _carregando = false; });
+      if (mounted) {
+        setState(() {
+          _imagem = bytes;
+          _carregando = false;
+        });
+      }
       return;
     }
     if (mounted) setState(() => _carregando = false);

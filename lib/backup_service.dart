@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:background_downloader/background_downloader.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:extension_google_sign_in_as_googleapis_auth/extension_google_sign_in_as_googleapis_auth.dart';
@@ -37,15 +39,28 @@ class BackupService {
   /// Configura notificação e permissão. Chamar no início, ANTES do listener e
   /// do iniciarMotor.
   static Future<void> configurar() async {
+    // Notificação ESTÁTICA de propósito. Os placeholders {numFinished}/{numTotal}
+    // do background_downloader contam só as tarefas do grupo ativas na janela
+    // (4 a 6 por vez), não o total real da sessão, então mostravam número errado
+    // (ou cru, quando não substituíam). Pior: a notificação "complete" disparava
+    // toda vez que a janela esvaziava entre uma leva e outra, gerando a enxurrada
+    // de notificações. Texto fixo aqui mata os dois problemas. O número real da
+    // sessão ("X de Y") e a barra de % vivem no banner do app, que é a fonte certa.
     FileDownloader().configureNotificationForGroup(
       grupo,
       running: const TaskNotification(
-          'Limpa Memória', 'Subindo backup: {numFinished} de {numTotal}'),
-      complete: const TaskNotification('Limpa Memória', 'Backup concluído ✓'),
+          'Limpa Memória', 'Fazendo backup… pode fechar o app'),
+      complete: const TaskNotification('Limpa Memória', 'Backup em dia'),
       error: const TaskNotification(
-          'Limpa Memória', 'Backup interrompido, reabra o app pra continuar'),
-      progressBar: true,
+          'Limpa Memória', 'Backup pausado, reabra o app pra continuar'),
+      progressBar: false,
     );
+    // Roda os uploads em primeiro plano: remove o teto de 9 minutos por tarefa
+    // do Android, que matava os vídeos grandes (e entupia a fila). Exige a
+    // notificação 'running' acima e a permissão FOREGROUND_SERVICE_DATA_SYNC +
+    // o serviço no AndroidManifest.
+    await FileDownloader()
+        .configure(globalConfig: (Config.runInForeground, Config.always));
     await FileDownloader().permissions.request(PermissionType.notifications);
   }
 
@@ -84,6 +99,12 @@ class BackupService {
     final ids = await FileDownloader()
         .allTaskIds(group: grupo, includeTasksWaitingToRetry: true);
     return ids.toSet();
+  }
+
+  /// Status de UM arquivo no banco (leitura barata por id).
+  static Future<TaskStatus?> statusDe(String id) async {
+    final r = await FileDownloader().database.recordForId(id);
+    return r?.status;
   }
 
   /// Quanto cabe no Drive. Devolve null se a conta não tem limite definido.
@@ -190,13 +211,59 @@ class BackupService {
     }
   }
 
+  /// Pré-cria/encontra todas as subpastas de uma leva ANTES de enfileirar em
+  /// paralelo. Sem isso, dois uploads paralelos da mesma pasta nova criariam a
+  /// pasta duas vezes no Drive. Roda em sequência (rápido, é só metadado) e
+  /// popula o cache; depois o paralelo só lê do cache.
+  static Future<void> garantirSubpastas(
+      GoogleSignIn gsi, Iterable<String> nomes) async {
+    if (_api == null || _mainId == null) {
+      final (ok, _) = await prepararContexto(gsi);
+      if (!ok) return;
+    }
+    for (final nome in nomes.toSet()) {
+      if (_subCache.containsKey(nome)) continue;
+      try {
+        _subCache[nome] = await _acharOuCriarPasta(_api!, nome, _mainId!);
+      } catch (_) {
+        // deixa pro enfileirarUm tentar de novo por arquivo
+      }
+    }
+  }
+
+  /// Repete uma chamada de rede em queda momentânea (DNS/socket caindo no meio
+  /// de um job de horas, o erro "Failed host lookup" da print). Espera crescente.
+  static Future<T> _comRetry<T>(Future<T> Function() fn,
+      {int tentativas = 4}) async {
+    var espera = const Duration(seconds: 2);
+    for (var i = 0;; i++) {
+      try {
+        return await fn();
+      } catch (e) {
+        final msg = '$e';
+        final transitorio = e is SocketException ||
+            e is http.ClientException ||
+            e is TimeoutException ||
+            msg.contains('Failed host lookup') ||
+            msg.contains('SocketException') ||
+            msg.contains('Connection reset') ||
+            msg.contains('Connection closed');
+        if (!transitorio || i >= tentativas - 1) rethrow;
+        await Future.delayed(espera);
+        espera *= 2;
+      }
+    }
+  }
+
   static Future<String> _acharOuCriarPasta(
       drive.DriveApi api, String nome, String? parentId) async {
     final nomeEsc = nome.replaceAll("'", r"\'");
     var q =
         "mimeType='application/vnd.google-apps.folder' and name='$nomeEsc' and trashed=false";
     if (parentId != null) q += " and '$parentId' in parents";
-    final res = await api.files.list(q: q, $fields: 'files(id,name)');
+    final res = await _comRetry(() => api.files
+        .list(q: q, $fields: 'files(id,name)')
+        .timeout(const Duration(seconds: 30)));
     if (res.files != null && res.files!.isNotEmpty) {
       return res.files!.first.id!;
     }
@@ -204,7 +271,8 @@ class BackupService {
       ..name = nome
       ..mimeType = 'application/vnd.google-apps.folder';
     if (parentId != null) nova.parents = [parentId];
-    final criada = await api.files.create(nova);
+    final criada =
+        await _comRetry(() => api.files.create(nova).timeout(const Duration(seconds: 30)));
     return criada.id!;
   }
 

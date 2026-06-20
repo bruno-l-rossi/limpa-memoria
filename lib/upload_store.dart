@@ -12,8 +12,11 @@ import 'package:shared_preferences/shared_preferences.dart';
 class UploadStore {
   static const _kEnviados = 'ids_enviados';
   static const _kJob = 'job_pendente';
+  static const _kTamanhos = 'tamanhos_cache';
+  static const _kPausado = 'backup_pausado';
 
   Set<String>? _cache;
+  Map<String, int>? _tamCache;
   Timer? _timer;
 
   Future<Set<String>> enviados() async {
@@ -67,6 +70,48 @@ class UploadStore {
   Future<void> limparJob() async {
     final p = await SharedPreferences.getInstance();
     await p.remove(_kJob);
+  }
+
+  /// Cache de tamanhos por id (em bytes). Ler o tamanho de um arquivo via
+  /// asset.file é caro (no Android chega a copiar o vídeo pro cache). Num celular
+  /// com 19 mil arquivos, refazer isso a cada abertura custava minutos. Aqui a
+  /// gente guarda o tamanho por id (id é imutável) e só lê o que apareceu de novo.
+  Future<Map<String, int>> tamanhos() async {
+    if (_tamCache != null) return _tamCache!;
+    final p = await SharedPreferences.getInstance();
+    final raw = p.getString(_kTamanhos);
+    if (raw == null || raw.isEmpty) {
+      _tamCache = {};
+      return _tamCache!;
+    }
+    try {
+      final m = (jsonDecode(raw) as Map)
+          .map((k, v) => MapEntry(k.toString(), (v as num).toInt()));
+      _tamCache = Map<String, int>.from(m);
+    } catch (_) {
+      _tamCache = {};
+    }
+    return _tamCache!;
+  }
+
+  /// Mescla novos tamanhos no cache e grava. Chamado em lote durante a leitura.
+  Future<void> salvarTamanhos(Map<String, int> novos) async {
+    final cache = await tamanhos();
+    cache.addAll(novos);
+    final p = await SharedPreferences.getInstance();
+    await p.setString(_kTamanhos, jsonEncode(cache));
+  }
+
+  /// Flag de backup pausado. Guardada pra que, se o usuário parar e fechar o app,
+  /// ele não retome sozinho ao reabrir (só quando o usuário tocar em Retomar).
+  Future<bool> pausado() async {
+    final p = await SharedPreferences.getInstance();
+    return p.getBool(_kPausado) ?? false;
+  }
+
+  Future<void> setPausado(bool v) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setBool(_kPausado, v);
   }
 
   /// Migração única: limpa a fila herdada das builds antigas só uma vez.
