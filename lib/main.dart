@@ -11,6 +11,7 @@ import 'package:extension_google_sign_in_as_googleapis_auth/extension_google_sig
 import 'package:background_downloader/background_downloader.dart';
 import 'upload_store.dart';
 import 'backup_service.dart';
+import 'nativo.dart';
 
 void main() => runApp(const MyApp());
 
@@ -72,7 +73,8 @@ class MediaItem {
   final AssetEntity asset;
   int bytes;
   final String pasta;
-  MediaItem(this.asset, this.bytes, this.pasta);
+  String path; // caminho real no disco (MediaStore); vazio se não veio
+  MediaItem(this.asset, this.bytes, this.pasta, {this.path = ''});
 }
 
 class Pasta {
@@ -100,6 +102,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _calculando = false;
   int _lidos = 0;
 
+  // Ordenação cacheada: ordenar 19 mil itens a cada build (e tem build a cada
+  // conclusão e a cada tick de 15s) era jank de horas. Recalcula só quando a
+  // ordem ou os dados mudam; o filtro em cima é O(n) barato.
+  List<MediaItem>? _ordenadoCache;
+  String _ordenadoChave = '';
+
   final GoogleSignIn _gsi = GoogleSignIn(
     scopes: ['https://www.googleapis.com/auth/drive.file'],
   );
@@ -108,98 +116,182 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // Backup em segundo plano.
   final UploadStore _store = UploadStore();
   Set<String> _enviadosIds = {}; // ids já confirmados no Drive
-  final Set<String> _emFila = {}; // total estável da sessão (denominador da barra)
+  final Set<String> _emFila = {}; // total estável da sessão (denominador)
   int _falhasBg = 0; // uploads que falharam de vez
+  final List<ItemBackup> _falhos = []; // os itens falhos, pro botão de retry
   String? _erroBg; // último motivo de erro, pra mostrar na tela
-  bool _pausado = false; // backup pausado pelo usuário
+  bool _pausado = false; // backup pausado (pelo usuário ou por Drive cheio)
+  bool _driveCheio = false; // pausa automática por cota estourada
+  bool _soWifi = false; // subir só no wifi (escolha do usuário)
   StreamSubscription<TaskUpdate>? _sub;
 
   // Janela deslizante guiada pelo banco da biblioteca (a fonte da verdade).
-  static const int _janela = 6; // alguns por vez; preparo agora roda em paralelo
+  //
+  // Rodada 8: janela de 6 pra 40. A janela pequena tinha um custo escondido:
+  // se o Android mata o app, só o que já está no motor termina. Com 40, um
+  // kill de madrugada ainda deixa horas de upload andando sozinho. O preparo
+  // continua em levas de 6 por vez pra não abrir 40 arquivos de uma vez.
+  static const int _janela = 40;
+  static const int _concorrenciaPreparo = 6;
   final List<ItemBackup> _pendentes = []; // ainda não enfileirados
   final Set<String> _emAndamento = {}; // ativos no motor agora (só pra exibir)
   final Map<String, int> _tentativas = {}; // re-tentativas por id
-  bool _sincronizando = false; // trava de reentrância
+  bool _reconciliando = false; // trava de reentrância (parte barata)
+  bool _alimentando = false; // trava de reentrância (parte lenta)
   Timer? _poll; // sincroniza com o banco a cada 15s
+
+  // Info do MediaStore (canal nativo): bytes e caminho real por id.
+  Map<String, MidiaNativa> _midiaInfo = {};
+
+  // Velocidade e estimativa: bytes por id da sessão + amostras recentes.
+  final Map<String, int> _bytesPorId = {};
+  final List<(DateTime, int)> _amostras = []; // (quando, bytes concluídos)
 
   int get _bgTotal => _emFila.length;
   int get _bgFeitos => _emFila.where(_enviadosIds.contains).length;
 
-  /// Pergunta ao banco da biblioteca o que concluiu e o que está ativo, atualiza
-  /// a contagem e repõe a janela. Chamado a cada 15s e quando algo termina. Não
-  /// depende de capturar todo evento ao vivo (que pode se perder num job longo):
-  /// o banco é a fonte da verdade, então a janela nunca congela de vez.
-  ///
-  /// O preparo de cada arquivo (achar pasta, abrir o arquivo, criar a sessão do
-  /// Drive) agora roda em PARALELO numa leva só. Antes era um a um, em fila, e
-  /// esse preparo serial era o gargalo: a banda ficava ociosa esperando o app
-  /// preparar o próximo. Em paralelo a janela enche rápido e a rede trabalha.
-  Future<void> _sincronizarEAlimentar() async {
-    if (_sincronizando || _conta == null || _emFila.isEmpty) return;
-    _sincronizando = true;
+  // ---------------------------------------------------------------------------
+  // Motor: reconciliar (barato, roda sempre) + alimentar (lento, com trava)
+  // ---------------------------------------------------------------------------
+
+  /// Tick do motor: reconcilia com o banco e depois repõe a janela. Separados
+  /// de propósito: antes uma trava única segurava a reconciliação enquanto um
+  /// preparo lento rodava, e a janela secava esperando o próximo tick.
+  Future<void> _tick() async {
+    await _reconciliar();
+    await _alimentar();
+  }
+
+  /// Pergunta ao banco da biblioteca o que está ativo e o que concluiu, e
+  /// atualiza a contagem. Não depende de capturar todo evento ao vivo (que se
+  /// perde em job longo): o banco é a fonte da verdade.
+  Future<void> _reconciliar() async {
+    if (_reconciliando || _conta == null || _emFila.isEmpty) return;
+    _reconciliando = true;
     try {
       final anterior = Set<String>.of(_emAndamento);
-      // O que está ativo no motor agora (consulta barata, só os ativos).
       final ativos = (await BackupService.idsAtivos())
           .where((id) => !_enviadosIds.contains(id))
           .toSet();
-      // Quem saiu da janela desde a última vez: confere por id (leitura barata)
-      // se concluiu, e marca. Pega conclusões que o evento ao vivo perdeu.
       for (final id in anterior.difference(ativos)) {
         final st = await BackupService.statusDe(id);
         if (st == TaskStatus.complete && !_enviadosIds.contains(id)) {
-          await _store.marcarEnviado(id);
-          _enviadosIds.add(id);
+          await _confirmarEnvio(id, null, null);
         }
       }
       _emAndamento
         ..clear()
         ..addAll(ativos);
+      if (mounted) setState(() {});
+    } catch (_) {
+      // silencioso: tenta de novo no próximo tick
+    } finally {
+      _reconciliando = false;
+    }
+  }
 
-      // Pausado: só reconcilia o que terminou; não alimenta mais a janela.
-      if (!_pausado) {
-        final vagas = _janela - _emAndamento.length;
-        final lote = <ItemBackup>[];
-        while (lote.length < vagas && _pendentes.isNotEmpty) {
-          final item = _pendentes.removeAt(0);
-          if (_enviadosIds.contains(item.id) ||
-              _emAndamento.contains(item.id) ||
-              lote.any((e) => e.id == item.id)) {
+  /// Marca um arquivo como confirmado no Drive: store (linha em append),
+  /// contagem, velocidade e limpeza do registro no banco da biblioteca.
+  Future<void> _confirmarEnvio(String id, String? fileId, int? bytes) async {
+    if (_enviadosIds.contains(id)) return;
+    final b = bytes ?? _bytesPorId[id] ?? 0;
+    await _store.marcarEnviado(id, fileId: fileId, bytes: b > 0 ? b : null);
+    _enviadosIds.add(id);
+    _emAndamento.remove(id);
+    if (_emFila.contains(id) && b > 0) {
+      _amostras.add((DateTime.now(), b));
+    }
+    // Banco da biblioteca não precisa mais desse registro (o nosso store é a
+    // fonte). Sem essa limpeza o banco cresce sem limite e o boot fica lento.
+    await BackupService.limparRegistro(id);
+  }
+
+  /// Repõe a janela: pega pendentes, prepara em levas de 6 e enfileira.
+  Future<void> _alimentar() async {
+    if (_alimentando || _conta == null || _pausado || _emFila.isEmpty) return;
+    _alimentando = true;
+    try {
+      final vagas = _janela - _emAndamento.length;
+      final lote = <ItemBackup>[];
+      while (lote.length < vagas && _pendentes.isNotEmpty) {
+        final item = _pendentes.removeAt(0);
+        if (_enviadosIds.contains(item.id) ||
+            _emAndamento.contains(item.id) ||
+            lote.any((e) => e.id == item.id)) {
+          continue;
+        }
+        lote.add(item);
+      }
+      if (lote.isEmpty) return;
+
+      // Pré-cria as subpastas da leva ANTES do paralelo, senão dois uploads
+      // da mesma pasta nova criariam a pasta duas vezes no Drive.
+      await BackupService.garantirSubpastas(_gsi, lote.map((e) => e.pasta));
+
+      // Prepara em levas de 6: paralelo o bastante pra rede não ficar ociosa,
+      // sem abrir dezenas de arquivos grandes ao mesmo tempo.
+      for (var i = 0; i < lote.length; i += _concorrenciaPreparo) {
+        if (_pausado) {
+          _pendentes.insertAll(0, lote.sublist(i));
+          break;
+        }
+        final leva = lote.sublist(i, min(i + _concorrenciaPreparo, lote.length));
+        final res = await Future.wait(leva.map((item) async {
+          final (ok, erro) =
+              await BackupService.enfileirarUm(_gsi, item, soWifi: _soWifi);
+          return (item: item, ok: ok, erro: erro);
+        }));
+        var driveCheio = false;
+        for (final r in res) {
+          if (r.ok) {
+            _emAndamento.add(r.item.id);
             continue;
           }
-          lote.add(item);
-        }
-        if (lote.isNotEmpty) {
-          // Pré-cria as subpastas da leva ANTES do paralelo, senão dois uploads
-          // da mesma pasta nova criariam a pasta duas vezes no Drive.
-          await BackupService.garantirSubpastas(_gsi, lote.map((e) => e.pasta));
-          final res = await Future.wait(lote.map((item) async {
-            final (ok, erro) = await BackupService.enfileirarUm(_gsi, item);
-            return (item: item, ok: ok, erro: erro);
-          }));
-          for (final r in res) {
-            if (r.ok) {
-              _emAndamento.add(r.item.id);
-            } else {
-              final t = (_tentativas[r.item.id] ?? 0) + 1;
-              _tentativas[r.item.id] = t;
-              if (t <= 3) {
-                _pendentes.add(r.item); // volta pro fim da fila
-              } else {
-                _falhasBg++;
-                if (r.erro != null && r.erro!.isNotEmpty) _erroBg = r.erro;
-              }
-            }
+          if (r.erro == BackupService.erroDriveCheio) {
+            _pendentes.insert(0, r.item);
+            driveCheio = true;
+            continue;
           }
+          final t = (_tentativas[r.item.id] ?? 0) + 1;
+          _tentativas[r.item.id] = t;
+          if (t <= 3) {
+            _pendentes.add(r.item); // volta pro fim da fila
+          } else {
+            _falhasBg++;
+            _falhos.add(r.item);
+            if (r.erro != null && r.erro!.isNotEmpty) _erroBg = r.erro;
+          }
+        }
+        if (driveCheio) {
+          await _pausarPorDriveCheio();
+          break;
         }
       }
       if (mounted) setState(() {});
     } catch (_) {
-      // silencioso: tenta de novo no próximo ciclo de 15s
+      // silencioso: tenta de novo no próximo tick
     } finally {
-      _sincronizando = false;
+      _alimentando = false;
     }
   }
+
+  /// Drive sem espaço no meio do job: pausa sozinho com recado claro, em vez
+  /// de queimar retentativas arquivo por arquivo com erro genérico.
+  Future<void> _pausarPorDriveCheio() async {
+    await _store.setPausado(true);
+    if (mounted) {
+      setState(() {
+        _pausado = true;
+        _driveCheio = true;
+        _erroBg =
+            'O Drive encheu. Libere espaço na conta (ou assine mais) e toque em Retomar.';
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Ações do usuário
+  // ---------------------------------------------------------------------------
 
   Widget _barraAcoes() {
     return Padding(
@@ -218,7 +310,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           PopupMenuButton<String>(
             icon: const Icon(Icons.sort),
             tooltip: 'Ordenar',
-            onSelected: (v) => setState(() => _ordem = v),
+            onSelected: (v) => setState(() {
+              _ordem = v;
+              _ordenadoCache = null;
+            }),
             itemBuilder: (_) => [
               CheckedPopupMenuItem(
                   value: 'tamanho',
@@ -283,6 +378,117 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _alternarWifi() async {
+    final novo = !_soWifi;
+    await _store.setSoWifi(novo);
+    if (!mounted) return;
+    setState(() => _soWifi = novo);
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(novo
+            ? 'Só no wifi: os próximos arquivos esperam uma rede wifi.'
+            : 'Qualquer rede: sobe no wifi e em dados móveis.')));
+  }
+
+  /// Backup grande: sugere tomada e pede a isenção de bateria do Android, que
+  /// é o que impede o Doze de matar o job de madrugada.
+  Future<void> _prepararJobGrande(int precisa) async {
+    if (precisa < 5 * 1024 * 1024 * 1024) return;
+    final isenta = await Nativo.bateriaIsenta();
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Backup grande'),
+        content: Text(
+            'São ${_fmt(precisa)}. Isso leva horas, então:\n\n'
+            '1. Deixe o celular na tomada.\n'
+            '2. Deixe o app aberto (pode apagar a tela).\n'
+            '${isenta ? '' : '3. Permita que o app ignore a economia de bateria, senão o Android pode pausar o backup de madrugada.'}'),
+        actions: [
+          if (!isenta)
+            TextButton(
+              onPressed: () async {
+                Navigator.pop(ctx);
+                await Nativo.pedirIsencaoBateria();
+              },
+              child: const Text('Permitir bateria'),
+            ),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Entendi')),
+        ],
+      ),
+    );
+  }
+
+  /// Não cabe tudo no Drive: oferece subir só o que cabe, priorizando os
+  /// maiores (liberam mais espaço no celular). Devolve a lista aparada, ou
+  /// null se o usuário cancelou.
+  Future<List<ItemBackup>?> _apararPraCaber(
+      List<ItemBackup> pendentes, int precisa, int livre) async {
+    const margem = 200 * 1024 * 1024; // 200 MB de folga
+    final orcamento = livre - margem;
+    final ordenados = List<ItemBackup>.from(pendentes)
+      ..sort((a, b) => b.bytes.compareTo(a.bytes));
+    final cabem = <ItemBackup>[];
+    var soma = 0;
+    for (final it in ordenados) {
+      if (it.bytes <= 0) continue;
+      if (soma + it.bytes > orcamento) continue;
+      soma += it.bytes;
+      cabem.add(it);
+    }
+    if (!mounted) return null;
+    final escolha = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Não cabe tudo no Drive'),
+        content: Text(
+            'Você marcou ${_fmt(precisa)}, mas só tem ${_fmt(livre)} livres.\n\n'
+            'Posso subir só o que cabe: ${cabem.length} arquivos (${_fmt(soma)}), começando pelos maiores. O resto fica pra depois que você liberar espaço.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancelar')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Subir o que cabe')),
+        ],
+      ),
+    );
+    if (escolha != true) return null;
+    return cabem;
+  }
+
+  /// Reinstalou o app? O store zera, mas o backup continua no Drive. O escopo
+  /// drive.file enxerga o que o próprio app criou, então dá pra reconhecer o
+  /// que já subiu (por nome + pasta + tamanho) e não duplicar nada.
+  Future<void> _reconhecerBackupAntigo() async {
+    if (_enviadosIds.isNotEmpty) return;
+    final noDrive = await BackupService.listarNoDrive(_gsi);
+    if (noDrive == null || noDrive.isEmpty) return;
+    final porChave = <String, ArquivoDrive>{};
+    for (final a in noDrive) {
+      porChave['${a.nome}|${a.pasta}|${a.bytes}'] = a;
+    }
+    var achados = 0;
+    for (final m in _items) {
+      final chave = '${m.asset.title ?? ''}|${m.pasta}|${m.bytes}';
+      final a = porChave[chave];
+      if (a == null) continue;
+      await _store.marcarEnviado(m.asset.id, fileId: a.fileId, bytes: m.bytes);
+      _enviadosIds.add(m.asset.id);
+      achados++;
+    }
+    await _store.gravarAgora();
+    if (achados > 0 && mounted) {
+      setState(() {});
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(
+              'Achei $achados arquivos de um backup anterior no Drive. Eles não sobem de novo.')));
+    }
+  }
+
   Future<void> _subir() async {
     if (_conta == null) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -290,53 +496,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return;
     }
 
-    // Os selecionados viram itens. A sessão (job) é MESCLADA, nunca reescrita
-    // menor: é o que faz o total da barra ficar estável do começo ao fim. Antes,
-    // cada toque em Subir salvava só "o que ainda falta", então o denominador
-    // caía (19000 -> 14000 -> 200). Se a sessão anterior já terminou, começa nova.
-    final selecionados = _selected
-        .map((m) => ItemBackup(m.asset.id, m.asset.title ?? 'sem nome', m.pasta))
-        .toList();
-
-    final jobAtual = await _store.job();
-    final sessaoTerminou =
-        _emFila.isNotEmpty && _emFila.every(_enviadosIds.contains);
-    final Map<String, Map<String, String>> mapa = {};
-    if (!sessaoTerminou) {
-      for (final m in jobAtual) {
-        final id = m['id'] ?? '';
-        if (id.isNotEmpty) mapa[id] = m;
-      }
-    }
-    for (final it in selecionados) {
-      mapa[it.id] = it.toMap();
-    }
-    final mergedItens = mapa.values.map(ItemBackup.fromMap).toList();
-
-    // O que ainda falta subir nesta sessão (não re-sobe o que já está no Drive).
-    final pendentesItens =
-        mergedItens.where((it) => !_enviadosIds.contains(it.id)).toList();
-    if (pendentesItens.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Tudo que você marcou já está no Drive.')));
-      return;
-    }
-
-    // Checa espaço (soma os bytes do que ainda falta subir).
-    final idsPendentes = pendentesItens.map((e) => e.id).toSet();
-    final precisa = _items
-        .where((m) => idsPendentes.contains(m.asset.id))
-        .fold<int>(0, (s, m) => s + m.bytes);
-    final livre = await BackupService.espacoLivre(_gsi);
-    if (livre != null && precisa > livre) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(
-              'Não cabe. Precisa de ${_fmt(precisa)}, livre ${_fmt(livre)}.')));
-      return;
-    }
-
-    // Prepara o contexto (token + pasta principal) antes de alimentar a janela.
+    // Prepara o contexto (token + pasta principal) logo, porque a
+    // reconciliação de backup antigo também precisa dele.
     final (ok, erroCtx) = await BackupService.prepararContexto(_gsi);
     if (!ok) {
       if (!mounted) return;
@@ -355,35 +516,93 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return;
     }
 
+    // Primeira vez com store vazio: confere se já existe backup no Drive
+    // (caso reinstalação) antes de decidir o que sobe.
+    await _reconhecerBackupAntigo();
+
+    // Os selecionados viram itens (com caminho real e bytes do MediaStore).
+    // A sessão (job) é MESCLADA, nunca reescrita menor: é o que mantém o
+    // total da barra estável do começo ao fim.
+    final selecionados = _selected
+        .map((m) => ItemBackup(m.asset.id, m.asset.title ?? 'sem nome', m.pasta,
+            path: m.path, bytes: m.bytes))
+        .toList();
+
+    final jobAtual = await _store.job();
+    final sessaoTerminou =
+        _emFila.isNotEmpty && _emFila.every(_enviadosIds.contains);
+    final Map<String, Map<String, String>> mapa = {};
+    if (!sessaoTerminou) {
+      for (final m in jobAtual) {
+        final id = m['id'] ?? '';
+        if (id.isNotEmpty) mapa[id] = m;
+      }
+    }
+    for (final it in selecionados) {
+      mapa[it.id] = it.toMap();
+    }
+    var mergedItens = mapa.values.map(ItemBackup.fromMap).toList();
+
+    // O que ainda falta subir nesta sessão.
+    var pendentesItens =
+        mergedItens.where((it) => !_enviadosIds.contains(it.id)).toList();
+    if (pendentesItens.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Tudo que você marcou já está no Drive.')));
+      return;
+    }
+
+    // Checa espaço. Se não cabe, oferece subir só o que cabe.
+    final precisa = pendentesItens.fold<int>(0, (s, it) => s + it.bytes);
+    final livre = await BackupService.espacoLivre(_gsi);
+    if (livre != null && precisa > livre) {
+      final aparados = await _apararPraCaber(pendentesItens, precisa, livre);
+      if (aparados == null || aparados.isEmpty) return;
+      pendentesItens = aparados;
+      final idsAparados = aparados.map((e) => e.id).toSet();
+      mergedItens = mergedItens
+          .where((it) =>
+              _enviadosIds.contains(it.id) || idsAparados.contains(it.id))
+          .toList();
+    }
+
+    // Job grande: tomada + isenção de bateria.
+    await _prepararJobGrande(pendentesItens.fold<int>(0, (s, it) => s + it.bytes));
+
     await _store.salvarJob(mergedItens.map((e) => e.toMap()).toList());
     await _store.setPausado(false);
 
     if (mounted) {
       setState(() {
         _pausado = false;
+        _driveCheio = false;
         _falhasBg = 0;
+        _falhos.clear();
         _erroBg = null;
         _tentativas.clear();
-        // Total estável: todos os itens da sessão (mesclados).
+        _amostras.clear();
         _emFila
           ..clear()
           ..addAll(mergedItens.map((e) => e.id));
-        // Pendentes = o que falta; a janela vai puxando aos poucos.
+        _bytesPorId
+          ..clear()
+          ..addEntries(mergedItens.map((e) => MapEntry(e.id, e.bytes)));
         _pendentes
           ..clear()
           ..addAll(pendentesItens);
       });
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content: Text(
-              'Backup começou. Sobe aos poucos, pode fechar o app que continua sozinho.')));
+              'Backup começou. Deixe o app aberto na tomada pra ir até o fim sem parar.')));
     }
 
-    _sincronizarEAlimentar();
+    _tick();
   }
 
-  /// Para o backup: deixa de alimentar a janela (o que já estava subindo termina
-  /// sozinho) e limpa os pendentes. O job fica salvo, então o Retomar reconstrói
-  /// o que falta a partir de job menos enviados, sem re-subir nada (sem duplicata).
+  /// Para o backup: deixa de alimentar a janela (o que já estava subindo
+  /// termina sozinho) e limpa os pendentes. O job fica salvo, então o Retomar
+  /// reconstrói o que falta sem re-subir nada.
   Future<void> _parar() async {
     await _store.setPausado(true);
     if (mounted) {
@@ -399,7 +618,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Future<void> _retomar() async {
     await _store.setPausado(false);
-    if (mounted) setState(() => _pausado = false);
+    if (mounted) {
+      setState(() {
+        _pausado = false;
+        _driveCheio = false;
+        _erroBg = null;
+      });
+    }
     final job = await _store.job();
     await _retomarJanela(job);
     if (mounted) {
@@ -408,44 +633,128 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  /// Devolve os que falharam de vez pra fila, com contador zerado.
+  Future<void> _tentarFalhosDeNovo() async {
+    if (_falhos.isEmpty) return;
+    setState(() {
+      for (final it in _falhos) {
+        _tentativas.remove(it.id);
+        _pendentes.add(it);
+      }
+      _falhos.clear();
+      _falhasBg = 0;
+      _erroBg = null;
+    });
+    _tick();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Apagar do celular (agora com conferência real no Drive)
+  // ---------------------------------------------------------------------------
+
   Future<void> _apagarEnviados() async {
-    // Só apaga do celular o que está confirmado no Drive E ainda na lista.
     final idsNoCelular = _items.map((m) => m.asset.id).toSet();
-    final ids = _enviadosIds.where(idsNoCelular.contains).toList();
-    if (ids.isEmpty) {
+    final candidatos = _enviadosIds.where(idsNoCelular.contains).toList();
+    if (candidatos.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Nada confirmado no Drive ainda. Suba antes de apagar.')));
+          content:
+              Text('Nada confirmado no Drive ainda. Suba antes de apagar.')));
       return;
     }
 
     final bytes = _items
-        .where((m) => ids.contains(m.asset.id))
+        .where((m) => candidatos.contains(m.asset.id))
         .fold<int>(0, (s, m) => s + m.bytes);
     final confirma = await showDialog<bool>(
       context: context,
       builder: (_) => AlertDialog(
         title: const Text('Apagar do celular'),
         content: Text(
-            'Apagar ${ids.length} arquivos (${_fmt(bytes)}) que já estão no Drive?\n\nO Android vai pedir confirmação em algumas levas.'),
+            'Apagar ${candidatos.length} arquivos (${_fmt(bytes)})?\n\nAntes de apagar, o app confere um a um no Drive. O que não estiver conferido fica no celular.\n\nO Android vai pedir confirmação em algumas levas.'),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(context, false),
               child: const Text('Cancelar')),
           TextButton(
               onPressed: () => Navigator.pop(context, true),
-              child: const Text('Apagar')),
+              child: const Text('Conferir e apagar')),
         ],
       ),
     );
     if (confirma != true) return;
 
-    // Apaga em LOTES. Mandar milhares de ids de uma vez estoura o limite do
-    // Android (TransactionTooLargeException) e o clique não fazia nada. Em lotes
-    // de 800 cada chamada cabe; o Android pede confirmação por lote.
+    // Conferência real: lista o que existe no Drive e só apaga o que bater
+    // por fileId + tamanho (ou nome + pasta + tamanho, pros envios antigos
+    // que ainda não guardavam fileId).
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const AlertDialog(
+        content: Row(children: [
+          CircularProgressIndicator(),
+          SizedBox(width: 16),
+          Expanded(child: Text('Conferindo no Drive…')),
+        ]),
+      ),
+    );
+    final noDrive = await BackupService.listarNoDrive(_gsi);
+    if (mounted) Navigator.pop(context); // fecha o "conferindo"
+    if (noDrive == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text(
+                'Sem rede pra conferir no Drive. Sem conferência, nada é apagado.')));
+      }
+      return;
+    }
+    final tamPorFileId = <String, int>{};
+    final porChave = <String, int>{}; // nome|pasta|bytes -> quantos existem
+    for (final a in noDrive) {
+      tamPorFileId[a.fileId] = a.bytes;
+      final chave = '${a.nome}|${a.pasta}|${a.bytes}';
+      porChave[chave] = (porChave[chave] ?? 0) + 1;
+    }
+    final itemPorId = {for (final m in _items) m.asset.id: m};
+    final verificados = <String>[];
+    var naoConferidos = 0;
+    for (final id in candidatos) {
+      final info = _store.envioDe(id);
+      final item = itemPorId[id];
+      final fid = info?.fileId;
+      final ibytes = info?.bytes;
+      var ok = false;
+      if (fid != null) {
+        final tam = tamPorFileId[fid];
+        ok = tam != null && (ibytes == null || tam == ibytes);
+      } else if (item != null) {
+        final chave = '${item.asset.title ?? ''}|${item.pasta}|${item.bytes}';
+        final quantos = porChave[chave] ?? 0;
+        if (quantos > 0) {
+          porChave[chave] = quantos - 1; // consome, pra não validar 2 locais com 1 do Drive
+          ok = true;
+        }
+      }
+      if (ok) {
+        verificados.add(id);
+      } else {
+        naoConferidos++;
+      }
+    }
+    if (verificados.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text(
+                'Não consegui conferir nenhum arquivo no Drive. Nada foi apagado.')));
+      }
+      return;
+    }
+
+    // Apaga em LOTES de 800 (mais que isso estoura o limite do Android).
     const tamLote = 800;
     final List<String> apagadosAll = [];
-    for (var i = 0; i < ids.length; i += tamLote) {
-      final chunk = ids.sublist(i, min(i + tamLote, ids.length));
+    for (var i = 0; i < verificados.length; i += tamLote) {
+      final chunk = verificados.sublist(i, min(i + tamLote, verificados.length));
       try {
         final apag = await PhotoManager.editor.deleteWithIds(chunk);
         apagadosAll.addAll(apag);
@@ -466,6 +775,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _enviadosIds.removeAll(setApagados);
       _selected.removeWhere((m) => setApagados.contains(m.asset.id));
       _emFila.removeAll(setApagados);
+      _ordenadoCache = null;
       final Map<String, List<MediaItem>> grupos = {};
       for (final it in _items) {
         grupos.putIfAbsent(it.pasta, () => []).add(it);
@@ -474,8 +784,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ..sort((a, b) => b.bytes.compareTo(a.bytes));
     });
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text('Apagados ${setApagados.length} do celular.')));
+        content: Text(naoConferidos > 0
+            ? 'Apagados ${setApagados.length}. Outros $naoConferidos não conferiram no Drive e ficaram no celular.'
+            : 'Apagados ${setApagados.length} do celular.')));
   }
+
+  // ---------------------------------------------------------------------------
+  // Boot
+  // ---------------------------------------------------------------------------
 
   @override
   void initState() {
@@ -483,10 +799,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _iniciarBackupEngine();
     _load();
-    // Rede de segurança: a cada 15s sincroniza com o banco e repõe a janela,
+    // Rede de segurança: a cada 15s reconcilia com o banco e repõe a janela,
     // mesmo que algum evento ao vivo tenha se perdido.
-    _poll = Timer.periodic(
-        const Duration(seconds: 15), (_) => _sincronizarEAlimentar());
+    _poll = Timer.periodic(const Duration(seconds: 15), (_) => _tick());
   }
 
   @override
@@ -500,7 +815,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // Indo pro fundo ou fechando: grava o progresso na hora, sem esperar o lote.
+    // Indo pro fundo ou fechando: garante o flush do progresso no disco.
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.inactive ||
         state == AppLifecycleState.detached) {
@@ -509,30 +824,33 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _iniciarBackupEngine() async {
+    // O store agora vive em arquivos na pasta de dados do app (aguenta 30 mil
+    // ids sem reescrever tudo a cada gravação). Init ANTES de qualquer leitura.
+    await _store.init(await Nativo.dirDados());
+
     await BackupService.configurar();
-    // Listener PRIMEIRO: o iniciarMotor() abaixo reprocessa o que terminou em
-    // segundo plano, e sem o listener no ar a gente perderia essas conclusões
-    // (era a causa da contagem zerando).
+    // Listener PRIMEIRO: o iniciarMotor() reprocessa o que terminou em segundo
+    // plano, e sem o listener no ar essas conclusões se perderiam.
     _sub = FileDownloader().updates.listen(_onUpdate);
     await BackupService.iniciarMotor();
 
-    // Reconcilia com o banco da biblioteca PRIMEIRO: tudo que consta como
-    // concluído (até o que subiu com o app fechado) entra nos enviados. Mantém a
-    // contagem certa e impede re-subir o que já está no Drive (sem duplicata).
+    // Reconcilia com o banco da biblioteca: tudo que consta como concluído
+    // (até o que subiu com o app fechado) entra nos enviados, e o registro
+    // reconciliado sai do banco (mantém o banco pequeno e o boot rápido).
     final concluidos = await BackupService.concluidosNoBanco();
     for (final id in concluidos) {
       await _store.marcarEnviado(id);
+      await BackupService.limparRegistro(id);
     }
     await _store.gravarAgora();
 
-    // Só depois de salvar o que já subiu: limpeza única da fila herdada das
-    // builds antigas (que enfileiravam tudo de uma vez). Roda uma vez por versão.
+    // Limpeza única da fila herdada das builds antigas.
     if (await _store.precisaLimparFila()) {
       await BackupService.limparFilaLegada();
       await _store.marcarFilaLimpa();
     }
 
-    // Restaura o login da última vez (sem pedir nada), pra poder retomar sozinho.
+    // Restaura o login da última vez (sem pedir nada), pra retomar sozinho.
     try {
       final conta = await _gsi.signInSilently();
       if (conta != null && mounted) setState(() => _conta = conta);
@@ -541,25 +859,29 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final enviados = await _store.enviados();
     final job = await _store.job();
     final pausado = await _store.pausado();
+    final soWifi = await _store.soWifi();
     if (mounted) {
       setState(() {
         _enviadosIds = enviados;
         _pausado = pausado;
+        _soWifi = soWifi;
         if (job.isNotEmpty) {
           _emFila
             ..clear()
             ..addAll(job.map((m) => m['id'] ?? ''));
+          _bytesPorId
+            ..clear()
+            ..addEntries(job.map((m) => MapEntry(
+                m['id'] ?? '', int.tryParse(m['bytes'] ?? '') ?? 0)));
         }
       });
     }
-    // Retoma sozinho na janela (a não ser que o usuário tenha deixado pausado):
-    // o que o job pedia, menos o que já subiu, vira pendente e a janela puxa.
+    // Retoma sozinho na janela (a não ser que o usuário tenha pausado).
     _retomarJanela(job);
   }
 
-  // Resposta rápida a um evento ao vivo. A contagem e a janela de verdade são
-  // mantidas pelo _sincronizarEAlimentar (banco da biblioteca), que é a rede de
-  // segurança caso algum evento se perca.
+  // Resposta rápida a um evento ao vivo. A rede de segurança é o tick de 15s
+  // guiado pelo banco da biblioteca.
   void _onUpdate(TaskUpdate update) async {
     if (update is! TaskStatusUpdate ||
         update.task.group != BackupService.grupo) {
@@ -567,29 +889,52 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
     final id = update.task.taskId;
     if (update.status == TaskStatus.complete) {
-      await _store.marcarEnviado(id);
-      if (mounted) setState(() => _enviadosIds.add(id));
-      _sincronizarEAlimentar();
+      // A resposta final do Drive traz o fileId e o tamanho: é a prova que a
+      // conferência antes de apagar usa.
+      final (fileId, bytes) =
+          BackupService.extrairArquivoDaResposta(update.responseBody);
+      await _confirmarEnvio(id, fileId, bytes);
+      // Se o arquivo local era uma cópia no cache do app, apaga (senão o cache
+      // cresce até o tamanho do backup num celular que já está cheio).
+      await BackupService.apagarCopiaDeCache(update.task);
+      if (mounted) setState(() {});
+      _tick();
     } else if (update.status == TaskStatus.failed ||
         update.status == TaskStatus.notFound) {
+      await BackupService.apagarCopiaDeCache(update.task);
+      final exc = update.exception;
+      final quota = exc is TaskHttpException && exc.httpResponseCode == 403;
+      if (quota) {
+        // 403 na URL da sessão (que dispensa auth) é cota estourada.
+        final meta = MetaTarefa.decodificar(update.task.metaData);
+        _pendentes.insert(
+            0,
+            ItemBackup(id, update.task.filename, meta.pasta,
+                bytes: meta.bytes));
+        await _pausarPorDriveCheio();
+        return;
+      }
       final t = (_tentativas[id] ?? 0) + 1;
       _tentativas[id] = t;
+      final meta = MetaTarefa.decodificar(update.task.metaData);
+      final item = ItemBackup(id, update.task.filename, meta.pasta,
+          bytes: meta.bytes);
       if (!_pausado &&
           t <= 3 &&
           _emFila.contains(id) &&
           !_enviadosIds.contains(id)) {
-        // Falhou mesmo depois das retentativas internas: tenta de novo com uma
-        // sessão nova, no fim da fila.
-        _pendentes.add(
-            ItemBackup(id, update.task.filename, update.task.metaData));
+        // Falhou mesmo depois das retentativas internas: tenta de novo com
+        // uma sessão nova, no fim da fila.
+        _pendentes.add(item);
       } else if (mounted) {
         setState(() {
           _falhasBg++;
+          _falhos.add(item);
           final desc = update.exception?.description;
           if (desc != null && desc.isNotEmpty) _erroBg = desc;
         });
       }
-      _sincronizarEAlimentar();
+      _tick();
     }
   }
 
@@ -614,9 +959,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ..clear()
         ..addAll(pendentes);
     });
-    // O sync pula sozinho os que já estão ativos no motor (não duplica).
-    _sincronizarEAlimentar();
+    _tick();
   }
+
+  // ---------------------------------------------------------------------------
+  // Galeria
+  // ---------------------------------------------------------------------------
 
   Future<void> _load() async {
     final ps = await PhotoManager.requestPermissionExtend();
@@ -640,15 +988,43 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
     final all = paths.first;
     final count = await all.assetCountAsync;
-    final assets = await all.getAssetListRange(start: 0, end: count);
-    final List<MediaItem> items = [
-      for (final a in assets) MediaItem(a, 0, _nomePasta(a))
-    ];
-    // Aplica os tamanhos já em cache: o que a gente leu antes não é lido de novo.
-    final cache = await _store.tamanhos();
+
+    // Uma consulta só ao MediaStore traz tamanho e caminho de tudo. Acaba com
+    // o "ler arquivo por arquivo" que custava minutos na primeira abertura.
+    final infoFut = Nativo.midias();
+
+    // Pagina a listagem: a primeira tela aparece em segundos mesmo com 19 mil
+    // arquivos, em vez de esperar um platform-call gigante.
+    const pagina = 1000;
+    final List<MediaItem> items = [];
+    for (var inicio = 0; inicio < count; inicio += pagina) {
+      final assets = await all.getAssetListRange(
+          start: inicio, end: min(inicio + pagina, count));
+      items.addAll(
+          [for (final a in assets) MediaItem(a, 0, _nomePasta(a))]);
+      if (inicio == 0 && mounted) {
+        setState(() {
+          _loading = false;
+          _items = items;
+          _calculando = true; // ainda paginando/medindo; o setState final corrige
+          _lidos = 0;
+          _status = 'Carregando galeria…';
+        });
+      }
+    }
+
+    _midiaInfo = await infoFut;
+    final cacheFallback = await _store.tamanhos();
     for (final it in items) {
-      final c = cache[it.asset.id];
-      if (c != null) it.bytes = c;
+      final info = _midiaInfo[it.asset.id];
+      if (info != null) {
+        if (info.bytes > 0) it.bytes = info.bytes;
+        it.path = info.caminho;
+      }
+      if (it.bytes == 0) {
+        final c = cacheFallback[it.asset.id];
+        if (c != null) it.bytes = c;
+      }
     }
     final Map<String, List<MediaItem>> grupos = {};
     for (final it in items) {
@@ -656,24 +1032,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
     final pastas = grupos.entries.map((e) => Pasta(e.key, e.value)).toList()
       ..sort((a, b) => b.bytes.compareTo(a.bytes));
-    final faltam = items.where((it) => !cache.containsKey(it.asset.id)).length;
+    final faltam = items.where((it) => it.bytes == 0).length;
+    if (!mounted) return;
     setState(() {
       _loading = false;
       _items = items;
       _pastas = pastas;
       _status = '${items.length} arquivos';
+      _ordenadoCache = null;
       _calculando = faltam > 0;
       _lidos = items.length - faltam;
     });
-    if (faltam > 0) _calcularTamanhos();
+    if (faltam > 0) _calcularTamanhosFallback();
   }
 
-  Future<void> _calcularTamanhos() async {
-    // Só lê o tamanho do que ainda não está no cache. Num celular com 19 mil
-    // arquivos, as aberturas seguintes ficam quase instantâneas.
-    final cache = await _store.tamanhos();
-    final pendentes =
-        _items.where((it) => !cache.containsKey(it.asset.id)).toList();
+  /// Fallback raro: mede só o que o MediaStore não devolveu (bytes == 0).
+  Future<void> _calcularTamanhosFallback() async {
+    final pendentes = _items.where((it) => it.bytes == 0).toList();
     final base = _items.length - pendentes.length;
     final novos = <String, int>{};
     for (var i = 0; i < pendentes.length; i++) {
@@ -694,10 +1069,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       }
     }
     if (novos.isNotEmpty) await _store.salvarTamanhos(novos);
+    // O fallback pode ter deixado cópias no cache do photo_manager: limpa,
+    // desde que nenhum upload esteja usando uma cópia agora.
+    if (_emAndamento.isEmpty) {
+      try {
+        await PhotoManager.clearFileCache();
+      } catch (_) {}
+    }
     if (!mounted) return;
     setState(() {
       _lidos = _items.length;
       _calculando = false;
+      _ordenadoCache = null;
       _pastas.sort((a, b) => b.bytes.compareTo(a.bytes));
     });
   }
@@ -709,13 +1092,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   List<MediaItem> get _itensOrdenados {
+    final ordemReal = (_ordem == 'data' || _calculando) ? 'data' : 'tamanho';
+    final chave = '$ordemReal|${_items.length}';
+    if (_ordenadoCache != null && _ordenadoChave == chave) {
+      return _ordenadoCache!;
+    }
     final lista = List<MediaItem>.from(_items);
-    if (_ordem == 'data' || _calculando) {
+    if (ordemReal == 'data') {
       lista.sort(
           (x, y) => y.asset.createDateTime.compareTo(x.asset.createDateTime));
     } else {
       lista.sort((x, y) => y.bytes.compareTo(x.bytes));
     }
+    _ordenadoCache = lista;
+    _ordenadoChave = chave;
     return lista;
   }
 
@@ -765,6 +1155,36 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         }
       });
 
+  // ---------------------------------------------------------------------------
+  // Velocidade e estimativa
+  // ---------------------------------------------------------------------------
+
+  /// Bytes por segundo na média dos últimos 5 minutos. 0 = sem dado ainda.
+  double get _velocidade {
+    final agora = DateTime.now();
+    _amostras.removeWhere((a) => agora.difference(a.$1).inSeconds > 300);
+    if (_amostras.length < 2) return 0;
+    final bytes = _amostras.fold<int>(0, (s, a) => s + a.$2);
+    final janela = agora.difference(_amostras.first.$1).inSeconds;
+    if (janela < 5) return 0;
+    return bytes / janela;
+  }
+
+  String _eta(int bytesRestantes) {
+    final v = _velocidade;
+    if (v <= 0 || bytesRestantes <= 0) return '';
+    final s = (bytesRestantes / v).round();
+    if (s < 90) return '~1 min restante';
+    if (s < 3600) return '~${(s / 60).round()} min restantes';
+    final h = s ~/ 3600;
+    final m = ((s % 3600) / 60).round();
+    return '~${h}h${m.toString().padLeft(2, '0')} restantes';
+  }
+
+  // ---------------------------------------------------------------------------
+  // UI
+  // ---------------------------------------------------------------------------
+
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
@@ -787,13 +1207,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               onPressed: _conta == null ? _login : _logout,
             ),
             IconButton(
+              icon: Icon(_soWifi ? Icons.wifi : Icons.wifi_tethering),
+              tooltip: _soWifi
+                  ? 'Subindo só no wifi (toque pra liberar dados móveis)'
+                  : 'Subindo em qualquer rede (toque pra exigir wifi)',
+              onPressed: _alternarWifi,
+            ),
+            IconButton(
               icon: const Icon(Icons.cloud_queue),
               tooltip: 'Espaço no Drive',
               onPressed: _conta == null ? null : _checarEspaco,
             ),
             IconButton(
               icon: const Icon(Icons.delete_outline),
-              tooltip: 'Apagar do celular (só os que já subiram)',
+              tooltip: 'Apagar do celular (confere no Drive antes)',
               onPressed: _enviadosIds.isEmpty ? null : _apagarEnviados,
             ),
           ],
@@ -867,8 +1294,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final total = _bgTotal;
     final feitos = _bgFeitos;
     final pronto = feitos >= total;
-    final pct = total == 0 ? 0.0 : feitos / total;
+
+    // Progresso por BYTES quando dá: mais honesto que contagem quando os
+    // vídeos grandes sobram pro fim. Cai pra contagem se não tem tamanho.
+    var bytesTotal = 0;
+    var bytesFeitos = 0;
+    for (final id in _emFila) {
+      final b = _bytesPorId[id] ?? 0;
+      bytesTotal += b;
+      if (_enviadosIds.contains(id)) bytesFeitos += b;
+    }
+    final pct = bytesTotal > 0
+        ? bytesFeitos / bytesTotal
+        : (total == 0 ? 0.0 : feitos / total);
     final faltam = total - feitos;
+    final eta = (!pronto && !_pausado) ? _eta(bytesTotal - bytesFeitos) : '';
+    final vel = _velocidade;
+
     return Container(
       width: double.infinity,
       color: _parchment,
@@ -922,17 +1364,37 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               child: Text(
                   _pausado
                       ? 'Pausado · faltam $faltam · toque em Retomar pra continuar'
-                      : 'Subindo agora: ${_emAndamento.length} · na fila: ${_pendentes.length} · pode fechar o app',
+                      : 'Subindo agora: ${_emAndamento.length} · na fila: ${_pendentes.length}'
+                          '${eta.isNotEmpty ? ' · $eta' : ''}'
+                          '${vel > 0 ? ' · ${_fmt(vel.round())}/s' : ''}',
                   style: const TextStyle(fontSize: 12, color: _inkMuted)),
+            ),
+          if (!pronto && !_pausado)
+            const Padding(
+              padding: EdgeInsets.only(top: 2),
+              child: Text(
+                  'Com o app fechado sobem só os que já estão na fila do Android. Pra ir até o fim, deixe aberto na tomada.',
+                  style: TextStyle(fontSize: 12, color: _inkMuted)),
             ),
           if (_falhasBg > 0 || _erroBg != null)
             Padding(
               padding: const EdgeInsets.only(top: 6),
-              child: Text(
-                _erroBg != null
-                    ? 'Problema: $_erroBg'
-                    : '$_falhasBg arquivo(s) falharam.',
-                style: const TextStyle(fontSize: 12, color: Color(0xFFB00020)),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      _erroBg != null
+                          ? 'Problema: $_erroBg'
+                          : '$_falhasBg arquivo(s) falharam.',
+                      style:
+                          const TextStyle(fontSize: 12, color: Color(0xFFB00020)),
+                    ),
+                  ),
+                  if (_falhos.isNotEmpty && !_driveCheio)
+                    TextButton(
+                        onPressed: _tentarFalhosDeNovo,
+                        child: Text('Tentar de novo (${_falhos.length})')),
+                ],
               ),
             ),
         ],
@@ -1017,8 +1479,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             itemCount: _pastas.length,
             itemBuilder: (context, i) {
               final p = _pastas[i];
-              final subiu =
-                  p.itens.where((it) => _enviadosIds.contains(it.asset.id)).length;
+              final subiu = p.itens
+                  .where((it) => _enviadosIds.contains(it.asset.id))
+                  .length;
               final todos = p.itens.length;
               final tudoNoDrive = todos > 0 && subiu == todos;
               return CheckboxListTile(

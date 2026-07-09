@@ -9,6 +9,9 @@
          Necessário pra subir vídeos grandes sem a tarefa ser morta. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <!-- Backup de horas: pedir isenção do Doze pra madrugada não matar o job.
+         O pedido abre o diálogo do próprio Android, o usuário decide. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
     <application
         android:label="limpa_memoria"
         android:name="${applicationName}"

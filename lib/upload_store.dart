@@ -1,109 +1,242 @@
-import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:shared_preferences/shared_preferences.dart';
 
-/// Guarda no próprio celular o que já subiu pro Drive e qual backup está em
-/// andamento. É isso que faz o app continuar de onde parou em vez de recomeçar
-/// do zero quando é fechado, perde sinal ou o celular reinicia.
+/// O que sabemos de um arquivo já enviado: o id do arquivo no Drive (pra
+/// conferir antes de apagar do celular) e o tamanho em bytes.
+class EnvioInfo {
+  final String? fileId;
+  final int? bytes;
+  const EnvioInfo({this.fileId, this.bytes});
+}
+
+/// Persistência no celular do que já subiu e do backup em andamento.
 ///
-/// A lista de enviados fica na memória como fonte da verdade e é gravada em
-/// lote (não a cada arquivo). Isso evita gravações se atropelando quando vários
-/// uploads terminam juntos, que era o que fazia o contador "voltar pro zero".
+/// Rodada 8: saiu do SharedPreferences (que reescreve um XML inteiro de vários
+/// MB a cada gravação e não aguenta 20-30 mil ids) pra arquivos próprios na
+/// pasta de dados do app:
+///
+/// - enviados.jsonl: UMA LINHA por arquivo enviado, em append. Gravar um envio
+///   custa uma linha, não o arquivo inteiro. Sobrevive a kill no meio (a linha
+///   ou entrou ou não entrou; nunca corrompe o resto).
+/// - job.json: o backup pedido pelo usuário. Escrita atômica (tmp + rename).
+/// - tamanhos.json: cache de tamanhos SÓ dos fallbacks (a fonte principal agora
+///   é o MediaStore via canal nativo, numa consulta só).
+///
+/// Flags pequenas (pausado, wifi, migrações) continuam no SharedPreferences,
+/// que é ótimo pra bool.
 class UploadStore {
-  static const _kEnviados = 'ids_enviados';
-  static const _kJob = 'job_pendente';
-  static const _kTamanhos = 'tamanhos_cache';
   static const _kPausado = 'backup_pausado';
+  static const _kWifi = 'so_wifi';
+  static const _kMigrouJanela = 'migrou_janela_v1';
+  static const _kMigrouArquivos = 'migrou_arquivos_v1';
+  // Chaves antigas (SharedPreferences), lidas só na migração única.
+  static const _kEnviadosLegado = 'ids_enviados';
+  static const _kJobLegado = 'job_pendente';
+  static const _kTamanhosLegado = 'tamanhos_cache';
 
-  Set<String>? _cache;
+  Directory? _dir;
+  final Map<String, EnvioInfo> _enviados = {};
   Map<String, int>? _tamCache;
-  Timer? _timer;
+  // Fila de escrita: appends encadeados um após o outro, cada um com flush.
+  // Sem buffer em memória = um kill não perde linha já "gravada".
+  Future<void> _filaEscrita = Future.value();
+  bool _pronto = false;
 
-  Future<Set<String>> enviados() async {
-    if (_cache != null) return _cache!;
+  File get _fEnviados => File('${_dir!.path}/enviados.jsonl');
+  File get _fJob => File('${_dir!.path}/job.json');
+  File get _fTamanhos => File('${_dir!.path}/tamanhos.json');
+
+  /// Chamar UMA vez no boot, antes de qualquer leitura. Carrega os enviados
+  /// pra memória e roda a migração do SharedPreferences se for a primeira vez.
+  Future<void> init(String? dirDados) async {
+    if (_pronto) return;
+    if (dirDados == null || dirDados.isEmpty) {
+      // Sem canal nativo (não deveria acontecer no Android). Segue só com o
+      // legado do SharedPreferences pra não perder o histórico.
+      await _carregarLegado();
+      _pronto = true;
+      return;
+    }
+    _dir = Directory(dirDados);
+    await _migrarSePrecisar();
+    await _carregarEnviados();
+    _pronto = true;
+  }
+
+  Future<void> _migrarSePrecisar() async {
     final p = await SharedPreferences.getInstance();
-    _cache = (p.getStringList(_kEnviados) ?? const <String>[]).toSet();
-    return _cache!;
+    if (p.getBool(_kMigrouArquivos) ?? false) return;
+    // Enviados antigos viram linhas (sem fileId/bytes; são o legado).
+    final antigos = p.getStringList(_kEnviadosLegado) ?? const <String>[];
+    if (antigos.isNotEmpty && !await _fEnviados.exists()) {
+      final buf = StringBuffer();
+      for (final id in antigos) {
+        buf.writeln(jsonEncode({'id': id}));
+      }
+      await _fEnviados.writeAsString(buf.toString(), flush: true);
+    }
+    // Job e tamanhos antigos viram os arquivos novos.
+    final jobRaw = p.getString(_kJobLegado);
+    if (jobRaw != null && jobRaw.isNotEmpty && !await _fJob.exists()) {
+      await _gravarAtomico(_fJob, jobRaw);
+    }
+    final tamRaw = p.getString(_kTamanhosLegado);
+    if (tamRaw != null && tamRaw.isNotEmpty && !await _fTamanhos.exists()) {
+      await _gravarAtomico(_fTamanhos, tamRaw);
+    }
+    // Tira os pesos do SharedPreferences (a causa dos XML de MB).
+    await p.remove(_kEnviadosLegado);
+    await p.remove(_kJobLegado);
+    await p.remove(_kTamanhosLegado);
+    await p.setBool(_kMigrouArquivos, true);
   }
 
-  Future<void> marcarEnviado(String id) async {
-    final set = await enviados();
-    if (set.add(id)) _agendarGravacao();
+  Future<void> _carregarEnviados() async {
+    _enviados.clear();
+    if (!await _fEnviados.exists()) return;
+    try {
+      final linhas = await _fEnviados.readAsLines();
+      for (final l in linhas) {
+        if (l.trim().isEmpty) continue;
+        try {
+          final m = jsonDecode(l) as Map;
+          final id = m['id']?.toString();
+          if (id == null || id.isEmpty) continue;
+          _enviados[id] = EnvioInfo(
+            fileId: m['fileId']?.toString(),
+            bytes: (m['bytes'] as num?)?.toInt(),
+          );
+        } catch (_) {
+          // linha meio escrita num kill: ignora, o resto do arquivo vale
+        }
+      }
+    } catch (_) {}
   }
 
-  void _agendarGravacao() {
-    _timer?.cancel();
-    _timer = Timer(const Duration(milliseconds: 800), gravarAgora);
+  Future<void> _carregarLegado() async {
+    final p = await SharedPreferences.getInstance();
+    for (final id in p.getStringList(_kEnviadosLegado) ?? const <String>[]) {
+      _enviados[id] = const EnvioInfo();
+    }
   }
 
-  /// Grava a lista atual no disco. Chamada em lote e quando o app vai pro fundo.
+  Future<void> _gravarAtomico(File f, String conteudo) async {
+    final tmp = File('${f.path}.tmp');
+    await tmp.writeAsString(conteudo, flush: true);
+    await tmp.rename(f.path);
+  }
+
+  // ---------- Enviados ----------
+
+  Future<Set<String>> enviados() async => _enviados.keys.toSet();
+
+  EnvioInfo? envioDe(String id) => _enviados[id];
+
+  /// Marca como enviado e grava NA HORA (uma linha em append; barato).
+  Future<void> marcarEnviado(String id, {String? fileId, int? bytes}) async {
+    final atual = _enviados[id];
+    if (atual != null &&
+        (fileId == null || atual.fileId == fileId) &&
+        (bytes == null || atual.bytes == bytes)) {
+      return; // nada novo pra gravar
+    }
+    _enviados[id] = EnvioInfo(
+      fileId: fileId ?? atual?.fileId,
+      bytes: bytes ?? atual?.bytes,
+    );
+    if (_dir == null) return;
+    final m = <String, Object>{'id': id};
+    final info = _enviados[id]!;
+    if (info.fileId != null) m['fileId'] = info.fileId!;
+    if (info.bytes != null) m['bytes'] = info.bytes!;
+    final linha = '${jsonEncode(m)}\n';
+    // Encadeia na fila: uma escrita por vez, com flush, sem se atropelar.
+    _filaEscrita = _filaEscrita.then((_) async {
+      try {
+        await _fEnviados.writeAsString(linha,
+            mode: FileMode.append, flush: true);
+      } catch (_) {}
+    });
+  }
+
+  /// Espera a fila de escrita esvaziar. Chamar ao ir pro fundo/fechar.
   Future<void> gravarAgora() async {
-    _timer?.cancel();
-    if (_cache == null) return;
-    final p = await SharedPreferences.getInstance();
-    await p.setStringList(_kEnviados, _cache!.toList());
+    try {
+      await _filaEscrita;
+    } catch (_) {}
   }
 
+  /// Esquece ids (apagados do celular) e compacta o arquivo: reescreve uma vez,
+  /// atômico. Acontece só no fluxo de apagar, que é raro.
   Future<void> esquecerEnviados(Iterable<String> ids) async {
-    final set = await enviados();
-    set.removeAll(ids.toSet());
-    await gravarAgora();
+    for (final id in ids) {
+      _enviados.remove(id);
+    }
+    if (_dir == null) return;
+    await gravarAgora(); // espera os appends pendentes antes de compactar
+    final buf = StringBuffer();
+    _enviados.forEach((id, info) {
+      final m = <String, Object>{'id': id};
+      if (info.fileId != null) m['fileId'] = info.fileId!;
+      if (info.bytes != null) m['bytes'] = info.bytes!;
+      buf.writeln(jsonEncode(m));
+    });
+    await _gravarAtomico(_fEnviados, buf.toString());
   }
 
-  /// O backup que o usuário pediu: lista de {id, titulo, pasta}. Serve pra saber
-  /// o total e o que ainda falta ao reabrir o app.
+  // ---------- Job ----------
+
+  /// O backup que o usuário pediu: lista de {id, titulo, pasta, bytes, path}.
   Future<void> salvarJob(List<Map<String, String>> itens) async {
-    final p = await SharedPreferences.getInstance();
-    await p.setString(_kJob, jsonEncode(itens));
+    if (_dir == null) return;
+    await _gravarAtomico(_fJob, jsonEncode(itens));
   }
 
   Future<List<Map<String, String>>> job() async {
-    final p = await SharedPreferences.getInstance();
-    final raw = p.getString(_kJob);
-    if (raw == null || raw.isEmpty) return [];
-    final lista = (jsonDecode(raw) as List).cast<Map>();
-    return lista
-        .map((m) => m.map((k, v) => MapEntry(k.toString(), v.toString())))
-        .toList();
+    if (_dir == null || !await _fJob.exists()) return [];
+    try {
+      final raw = await _fJob.readAsString();
+      if (raw.isEmpty) return [];
+      final lista = (jsonDecode(raw) as List).cast<Map>();
+      return lista
+          .map((m) => m.map((k, v) => MapEntry(k.toString(), v.toString())))
+          .toList();
+    } catch (_) {
+      return [];
+    }
   }
 
   Future<void> limparJob() async {
-    final p = await SharedPreferences.getInstance();
-    await p.remove(_kJob);
+    try {
+      if (_dir != null && await _fJob.exists()) await _fJob.delete();
+    } catch (_) {}
   }
 
-  /// Cache de tamanhos por id (em bytes). Ler o tamanho de um arquivo via
-  /// asset.file é caro (no Android chega a copiar o vídeo pro cache). Num celular
-  /// com 19 mil arquivos, refazer isso a cada abertura custava minutos. Aqui a
-  /// gente guarda o tamanho por id (id é imutável) e só lê o que apareceu de novo.
+  // ---------- Cache de tamanhos (só fallbacks) ----------
+
   Future<Map<String, int>> tamanhos() async {
     if (_tamCache != null) return _tamCache!;
-    final p = await SharedPreferences.getInstance();
-    final raw = p.getString(_kTamanhos);
-    if (raw == null || raw.isEmpty) {
-      _tamCache = {};
-      return _tamCache!;
-    }
-    try {
-      final m = (jsonDecode(raw) as Map)
-          .map((k, v) => MapEntry(k.toString(), (v as num).toInt()));
-      _tamCache = Map<String, int>.from(m);
-    } catch (_) {
-      _tamCache = {};
+    _tamCache = {};
+    if (_dir != null && await _fTamanhos.exists()) {
+      try {
+        final m = (jsonDecode(await _fTamanhos.readAsString()) as Map)
+            .map((k, v) => MapEntry(k.toString(), (v as num).toInt()));
+        _tamCache = Map<String, int>.from(m);
+      } catch (_) {}
     }
     return _tamCache!;
   }
 
-  /// Mescla novos tamanhos no cache e grava. Chamado em lote durante a leitura.
   Future<void> salvarTamanhos(Map<String, int> novos) async {
     final cache = await tamanhos();
     cache.addAll(novos);
-    final p = await SharedPreferences.getInstance();
-    await p.setString(_kTamanhos, jsonEncode(cache));
+    if (_dir == null) return;
+    await _gravarAtomico(_fTamanhos, jsonEncode(cache));
   }
 
-  /// Flag de backup pausado. Guardada pra que, se o usuário parar e fechar o app,
-  /// ele não retome sozinho ao reabrir (só quando o usuário tocar em Retomar).
+  // ---------- Flags ----------
+
   Future<bool> pausado() async {
     final p = await SharedPreferences.getInstance();
     return p.getBool(_kPausado) ?? false;
@@ -114,9 +247,19 @@ class UploadStore {
     await p.setBool(_kPausado, v);
   }
 
-  /// Migração única: limpa a fila herdada das builds antigas só uma vez.
-  static const _kMigrouJanela = 'migrou_janela_v1';
+  /// Subir só no wifi. Padrão desligado: exigir wifi já travou backup em 0%
+  /// quando o Android não classificava a rede (rodada 4). É escolha do usuário.
+  Future<bool> soWifi() async {
+    final p = await SharedPreferences.getInstance();
+    return p.getBool(_kWifi) ?? false;
+  }
 
+  Future<void> setSoWifi(bool v) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setBool(_kWifi, v);
+  }
+
+  /// Migração única da rodada 5: limpa a fila herdada das builds antigas.
   Future<bool> precisaLimparFila() async {
     final p = await SharedPreferences.getInstance();
     return !(p.getBool(_kMigrouJanela) ?? false);
