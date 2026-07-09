@@ -4,12 +4,15 @@ App Android que libera espaço no celular sem perder foto nem vídeo. Ele lista 
 
 ## O que ele faz
 
-- Lista fotos e vídeos por tamanho ou por data, com miniatura e prévia (vídeo toca).
-- Seleção por mídia ou por pasta inteira (WhatsApp, Download, Câmera, etc.), com "selecionar tudo".
+- Onboarding de 3 telas na primeira vez: o que o app faz, por que pede cada permissão, conectar o Google.
+- Card de missão no topo: quanto o celular tem em fotos e vídeos, quanto já está seguro no Drive e um botão "Liberar espaço" que resolve a jornada inteira.
+- Sugestões prontas de backup (vídeos grandes, WhatsApp, mais antigos que 1 ano, screenshots), cada uma com o quanto libera. Marca, confirma e o backup começa.
+- Grade de fotos com seleção por toque (segurar abre a prévia), badge de tamanho e nuvem nos que já subiram. Também dá pra selecionar por pasta inteira.
 - Filtro Todos / Fora do Drive / No Drive, pra ver rápido o que ainda falta subir.
 - Login com a conta Google e checagem do espaço livre no Drive. Se a seleção não cabe, oferece subir só o que cabe (começando pelos maiores, que liberam mais espaço).
-- Backup no Drive numa pasta "Limpa Memória", com subpastas pela origem de cada arquivo.
-- Backup em segundo plano com notificação, estimativa de tempo e velocidade no banner ("~2h10 restantes · 4,3 MB/s").
+- Backup no Drive numa pasta "Limpa Memória", com subpastas pela origem de cada arquivo. Duplicata exata (mesmo nome e tamanho, clássico do WhatsApp) sobe 1 vez só.
+- Backup em segundo plano com DUAS camadas de acompanhamento: o banner no app (ETA e velocidade, "~2h10 restantes · 4,3 MB/s") e uma notificação do sistema com o número real ("Backup: 4.312 de 19.000") e barra de progresso.
+- Ao concluir, celebra e fecha o ciclo: "N arquivos seguros no Drive. Liberar X GB do celular?", com botão de compartilhar.
 - Parar e retomar: parar deixa o que já estava subindo terminar e guarda o resto; retomar continua de onde parou, sem re-subir nada.
 - Retoma de onde parou sozinho: se o app fecha ou o celular reinicia no meio, ao reabrir ele pula o que já subiu e continua (login silencioso + re-enfileiramento do que faltou).
 - Aguenta queda de rede: 10 retentativas por arquivo com espera crescente, retry de DNS na organização das pastas, e botão "Tentar de novo" pros que falharam de vez.
@@ -17,11 +20,12 @@ App Android que libera espaço no celular sem perder foto nem vídeo. Ele lista 
 - Toggle "só no wifi" (padrão: qualquer rede; no wifi economiza dados).
 - Reinstalou o app? Ele reconhece o backup anterior no Drive e não sobe nada em dobro.
 - Ícone de drive na pasta quando todos os arquivos dentro dela já subiram (parcial mostra quantos de quantos).
+- Integridade de verdade: em arquivos até 256 MB, o MD5 local é comparado com o que o Drive calculou; divergiu, o app apaga o corrompido da nuvem e refaz o upload sozinho.
 - Apaga do celular só depois de CONFERIR no Drive, arquivo por arquivo (id + tamanho). O que não conferir fica no celular. A exclusão roda em lotes com a confirmação do próprio Android.
 
 ## Stack
 
-Flutter (Dart) + um canal nativo em Kotlin (MediaStore, isenção de bateria). Pacotes principais: photo_manager (galeria e deleção), google_sign_in, googleapis (Drive v3), background_downloader (upload em segundo plano + notificação), shared_preferences (flags), http, video_player, google_fonts. O progresso do backup fica em arquivos próprios do app (append + escrita atômica), não no SharedPreferences.
+Flutter (Dart) + um canal nativo em Kotlin (MediaStore, isenção de bateria, MD5, share e a notificação de progresso). Pacotes principais: photo_manager (galeria e deleção), google_sign_in, googleapis (Drive v3), background_downloader (upload em segundo plano + notificação), shared_preferences (flags), http, video_player, google_fonts. O progresso do backup fica em arquivos próprios do app (append + escrita atômica), não no SharedPreferences.
 
 ## Como o backup aguenta carga grande (100 GB, dezenas de milhares de arquivos)
 
@@ -39,7 +43,7 @@ Uma consulta só ao MediaStore (canal nativo) devolve tamanho e caminho de todas
 
 - O background_downloader não pausa um upload no meio. O "parar" do app interrompe os que ainda não começaram e deixa os que já estavam subindo terminarem; ele não corta um arquivo pela metade.
 - Com o app fechado, sobem só os até 40 arquivos que já estavam na fila do motor. Pra um backup de 100 GB ir até o fim sem toque, deixe o app aberto na tomada (o banner avisa isso).
-- O número exato "X de Y" e a barra ficam no banner dentro do app. A notificação do sistema é estática de propósito, porque os contadores do background_downloader só enxergam as tarefas da janela, não o total real da sessão.
+- Durante o backup aparecem 2 notificações: a fixa do serviço (obrigatória, é o que tira o teto de 9 min do Android) e a de progresso com o número real, atualizada pelo app. Com o app morto, a de progresso congela; a do serviço continua.
 - Apagar do celular acontece em lotes (limite do Android pra muitos arquivos de uma vez), então o Android pede confirmação em algumas levas quando a limpeza é grande.
 
 ## Rodando localmente

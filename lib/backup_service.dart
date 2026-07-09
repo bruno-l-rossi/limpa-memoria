@@ -17,8 +17,13 @@ class ItemBackup {
   final String pasta;
   final String path; // vazio = sem caminho direto, usa o fallback
   final int bytes; // 0 = desconhecido
+  // Duplicata exata: id do item PRINCIPAL que sobe no lugar deste (mesmo nome
+  // + mesmo tamanho). Item com dup não é enfileirado; quando o principal
+  // confirma, este é marcado como coberto pelo mesmo arquivo do Drive.
+  final String dup;
 
-  ItemBackup(this.id, this.titulo, this.pasta, {this.path = '', this.bytes = 0});
+  ItemBackup(this.id, this.titulo, this.pasta,
+      {this.path = '', this.bytes = 0, this.dup = ''});
 
   Map<String, String> toMap() => {
         'id': id,
@@ -26,6 +31,7 @@ class ItemBackup {
         'pasta': pasta,
         if (path.isNotEmpty) 'path': path,
         if (bytes > 0) 'bytes': '$bytes',
+        if (dup.isNotEmpty) 'dup': dup,
       };
 
   static ItemBackup fromMap(Map<String, String> m) => ItemBackup(
@@ -34,6 +40,7 @@ class ItemBackup {
         m['pasta'] ?? 'Outros',
         path: m['path'] ?? '',
         bytes: int.tryParse(m['bytes'] ?? '') ?? 0,
+        dup: m['dup'] ?? '',
       );
 }
 
@@ -323,14 +330,31 @@ class BackupService {
     }
   }
 
+  // Cache da listagem do Drive: apagar em 2 levas seguidas não lista 2 vezes.
+  static List<ArquivoDrive>? _cacheListagem;
+  static DateTime? _cacheListagemEm;
+  static const _validadeListagem = Duration(minutes: 10);
+
+  /// Invalida o cache da listagem (chamar quando algo novo sobe).
+  static void invalidarListagem() {
+    _cacheListagem = null;
+    _cacheListagemEm = null;
+  }
+
   /// Lista TUDO que está na pasta Limpa Memória do Drive (subpastas e seus
   /// arquivos), paginado. Duas serventias:
   /// - conferir de verdade antes de apagar do celular (fileId + tamanho);
   /// - reconhecer um backup antigo depois de reinstalar o app (o escopo
   ///   drive.file enxerga o que o próprio app criou, mesmo após reinstalar).
   /// Custo: 1 chamada por subpasta por página de 1000. Pra 19 mil arquivos,
-  /// coisa de ~25 chamadas de metadado.
+  /// coisa de ~25 chamadas de metadado. Resultado vale por 10 min.
   static Future<List<ArquivoDrive>?> listarNoDrive(GoogleSignIn gsi) async {
+    final em = _cacheListagemEm;
+    if (_cacheListagem != null &&
+        em != null &&
+        DateTime.now().difference(em) < _validadeListagem) {
+      return _cacheListagem;
+    }
     try {
       if (_api == null || _mainId == null) {
         final (ok, _) = await prepararContexto(gsi);
@@ -381,10 +405,25 @@ class BackupService {
           pt = res.nextPageToken;
         } while (pt != null);
       }
+      _cacheListagem = resultado;
+      _cacheListagemEm = DateTime.now();
       return resultado;
     } catch (_) {
       return null; // rede caiu no meio: quem chamou decide o que fazer
     }
+  }
+
+  /// Apaga um arquivo no Drive (usado quando o MD5 divergiu: tira o corrompido
+  /// de lá antes de re-subir, senão o refazer viraria duplicata).
+  static Future<void> apagarNoDrive(GoogleSignIn gsi, String fileId) async {
+    try {
+      if (_api == null) {
+        final (ok, _) = await prepararContexto(gsi);
+        if (!ok) return;
+      }
+      await _api!.files.delete(fileId).timeout(const Duration(seconds: 30));
+      invalidarListagem();
+    } catch (_) {}
   }
 
   /// Repete uma chamada de rede em queda momentânea (DNS/socket caindo no meio
@@ -433,15 +472,16 @@ class BackupService {
   }
 
   /// Abre uma sessão de upload retomável no Drive. Devolve (urlDaSessao, erro).
-  /// O fields=id,name,size faz a resposta FINAL do upload devolver o fileId e
-  /// o tamanho, que a gente guarda pra conferir antes de apagar do celular.
+  /// O fields=id,name,size,md5Checksum faz a resposta FINAL do upload devolver
+  /// o fileId, o tamanho e o MD5 que o Drive calculou, que a gente usa pra
+  /// conferir a integridade e pra liberar o apagar do celular.
   static Future<(String?, String?)> _criarSessao(
       String token, String nome, String folderId) async {
     try {
       final resp = await http
           .post(
             Uri.parse(
-                'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size'),
+                'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size,md5Checksum'),
             headers: {
               'Authorization': 'Bearer $token',
               'Content-Type': 'application/json; charset=UTF-8',
@@ -472,17 +512,21 @@ class BackupService {
     }
   }
 
-  /// Extrai o fileId (e tamanho) da resposta final de um upload concluído.
-  /// Devolve (fileId, bytes) ou (null, null) se a resposta não veio.
-  static (String?, int?) extrairArquivoDaResposta(String? responseBody) {
-    if (responseBody == null || responseBody.isEmpty) return (null, null);
+  /// Extrai fileId, tamanho e MD5 da resposta final de um upload concluído.
+  /// Devolve (null, null, null) se a resposta não veio.
+  static (String?, int?, String?) extrairArquivoDaResposta(
+      String? responseBody) {
+    if (responseBody == null || responseBody.isEmpty) {
+      return (null, null, null);
+    }
     try {
       final m = jsonDecode(responseBody) as Map;
       final id = m['id']?.toString();
       final size = int.tryParse(m['size']?.toString() ?? '');
-      return (id, size);
+      final md5 = m['md5Checksum']?.toString();
+      return (id, size, md5);
     } catch (_) {
-      return (null, null);
+      return (null, null, null);
     }
   }
 }

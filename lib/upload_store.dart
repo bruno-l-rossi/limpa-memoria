@@ -46,6 +46,7 @@ class UploadStore {
   File get _fEnviados => File('${_dir!.path}/enviados.jsonl');
   File get _fJob => File('${_dir!.path}/job.json');
   File get _fTamanhos => File('${_dir!.path}/tamanhos.json');
+  File get _fSessoes => File('${_dir!.path}/sessoes.jsonl');
 
   /// Chamar UMA vez no boot, antes de qualquer leitura. Carrega os enviados
   /// pra memória e roda a migração do SharedPreferences se for a primeira vez.
@@ -235,6 +236,22 @@ class UploadStore {
     await _gravarAtomico(_fTamanhos, jsonEncode(cache));
   }
 
+  // ---------- Telemetria local (diagnóstico, nada sai do celular) ----------
+
+  /// Grava o resumo de uma sessão de backup (uma linha em append): início,
+  /// fim, quantos arquivos, GB, falhas e o último erro. Sem isso, cada
+  /// travamento em job de horas vira sessão de detetive por print.
+  Future<void> registrarSessao(Map<String, Object?> resumo) async {
+    if (_dir == null) return;
+    final linha = '${jsonEncode(resumo)}\n';
+    _filaEscrita = _filaEscrita.then((_) async {
+      try {
+        await _fSessoes.writeAsString(linha,
+            mode: FileMode.append, flush: true);
+      } catch (_) {}
+    });
+  }
+
   // ---------- Flags ----------
 
   Future<bool> pausado() async {
@@ -257,6 +274,19 @@ class UploadStore {
   Future<void> setSoWifi(bool v) async {
     final p = await SharedPreferences.getInstance();
     await p.setBool(_kWifi, v);
+  }
+
+  /// Onboarding da primeira execução: mostrado uma vez só.
+  static const _kViuOnboarding = 'viu_onboarding_v1';
+
+  Future<bool> viuOnboarding() async {
+    final p = await SharedPreferences.getInstance();
+    return p.getBool(_kViuOnboarding) ?? false;
+  }
+
+  Future<void> marcarOnboardingVisto() async {
+    final p = await SharedPreferences.getInstance();
+    await p.setBool(_kViuOnboarding, true);
   }
 
   /// Migração única da rodada 5: limpa a fila herdada das builds antigas.

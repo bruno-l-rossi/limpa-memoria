@@ -1,27 +1,39 @@
 package com.rideblan.limpa_memoria
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.MediaStore
 import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
+import java.io.FileInputStream
+import java.security.MessageDigest
 
-/// Canal nativo do app. Três serviços que o Flutter não alcança direito:
+/// Canal nativo do app. Serviços que o Flutter não alcança direito, sem
+/// depender de plugin novo:
 ///
-/// 1. "midias": tamanho (SIZE) e caminho real (DATA) de TODAS as mídias numa
-///    consulta só ao MediaStore. Substitui abrir arquivo por arquivo via
-///    photo_manager, que chegava a COPIAR o vídeo pro cache só pra ler o
-///    tamanho. Numa galeria de 19 mil arquivos, é a diferença entre minutos
-///    e menos de 1 segundo.
-/// 2. "bateriaIsenta"/"pedirIsencaoBateria": isenção de otimização de bateria,
-///    pra um backup de horas não ser morto pelo Doze de madrugada.
-/// 3. "dirDados": pasta de dados do app pro armazenamento em arquivo do
-///    upload_store (sem depender de plugin novo).
+/// - "midias": tamanho (SIZE) e caminho real (DATA) de TODAS as mídias numa
+///   consulta só ao MediaStore (substitui abrir arquivo por arquivo).
+/// - "bateriaIsenta"/"pedirIsencaoBateria": isenção do Doze pra job de horas.
+/// - "dirDados": pasta de dados do app pro armazenamento em arquivo.
+/// - "md5": hash MD5 de um arquivo, em thread própria (integridade do upload).
+/// - "compartilhar": share sheet do Android com um texto.
+/// - "notificar"/"limparNotificacao": notificação de progresso com o número
+///   REAL da sessão ("4.312 de 19.000"), que o background_downloader não sabe.
 class MainActivity : FlutterActivity() {
     private val canal = "limpa_memoria/nativo"
+    private val canalNotif = "backup_progresso"
+    private val idNotif = 4242
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -34,6 +46,24 @@ class MainActivity : FlutterActivity() {
                     "pedirIsencaoBateria" -> {
                         pedirIsencaoBateria()
                         result.success(bateriaIsenta())
+                    }
+                    "md5" -> md5Async(call.argument<String>("path"), result)
+                    "compartilhar" -> {
+                        compartilhar(call.argument<String>("texto") ?: "")
+                        result.success(true)
+                    }
+                    "notificar" -> {
+                        notificar(
+                            call.argument<String>("titulo") ?: "Limpa Memória",
+                            call.argument<String>("texto") ?: "",
+                            call.argument<Int>("feitos") ?: 0,
+                            call.argument<Int>("total") ?: 0,
+                        )
+                        result.success(true)
+                    }
+                    "limparNotificacao" -> {
+                        limparNotificacao()
+                        result.success(true)
                     }
                     else -> result.notImplemented()
                 }
@@ -73,6 +103,76 @@ class MainActivity : FlutterActivity() {
             // Devolve o que conseguiu; o Dart tem fallback por arquivo.
         }
         return mapa
+    }
+
+    /// MD5 de um arquivo em thread própria (não trava a UI nem o canal).
+    /// Devolve o hash em hex minúsculo, ou null se não deu.
+    private fun md5Async(path: String?, result: MethodChannel.Result) {
+        if (path.isNullOrEmpty()) {
+            result.success(null)
+            return
+        }
+        val main = Handler(Looper.getMainLooper())
+        Thread {
+            var hex: String? = null
+            try {
+                val md = MessageDigest.getInstance("MD5")
+                FileInputStream(File(path)).use { fis ->
+                    val buf = ByteArray(1 shl 16)
+                    while (true) {
+                        val n = fis.read(buf)
+                        if (n <= 0) break
+                        md.update(buf, 0, n)
+                    }
+                }
+                hex = md.digest().joinToString("") { "%02x".format(it) }
+            } catch (_: Exception) {}
+            main.post { result.success(hex) }
+        }.start()
+    }
+
+    private fun compartilhar(texto: String) {
+        try {
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, texto)
+            }
+            startActivity(Intent.createChooser(intent, "Compartilhar"))
+        } catch (_: Exception) {}
+    }
+
+    /// Notificação com o número real da sessão e barra de progresso. Convive
+    /// com a notificação do foreground service (que é estática de propósito).
+    private fun notificar(titulo: String, texto: String, feitos: Int, total: Int) {
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                nm.createNotificationChannel(
+                    NotificationChannel(
+                        canalNotif, "Progresso do backup",
+                        NotificationManager.IMPORTANCE_LOW // sem som a cada update
+                    )
+                )
+            }
+            val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                Notification.Builder(this, canalNotif)
+            else
+                @Suppress("DEPRECATION") Notification.Builder(this)
+            b.setContentTitle(titulo)
+                .setContentText(texto)
+                .setSmallIcon(applicationInfo.icon)
+                .setOnlyAlertOnce(true)
+                .setOngoing(true)
+            if (total > 0) b.setProgress(total, feitos.coerceAtMost(total), false)
+            nm.notify(idNotif, b.build())
+        } catch (_: Exception) {}
+    }
+
+    private fun limparNotificacao() {
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.cancel(idNotif)
+        } catch (_: Exception) {}
     }
 
     private fun bateriaIsenta(): Boolean {

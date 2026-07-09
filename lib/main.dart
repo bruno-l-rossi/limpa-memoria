@@ -84,6 +84,25 @@ class Pasta {
   int get bytes => itens.fold(0, (s, i) => s + i.bytes);
 }
 
+/// Cache LRU de miniaturas em memória. O mesmo Uint8List reaproveitado faz o
+/// Flutter reaproveitar também a imagem decodificada, então o scroll na grade
+/// de milhares de itens deixa de re-decodificar a cada rebuild.
+class _ThumbCache {
+  static final Map<String, Uint8List> _mapa = {};
+  static const _max = 400;
+
+  static Uint8List? pegar(String id) {
+    final v = _mapa.remove(id);
+    if (v != null) _mapa[id] = v; // reinsere no fim (mais recente)
+    return v;
+  }
+
+  static void guardar(String id, Uint8List bytes) {
+    if (_mapa.length >= _max) _mapa.remove(_mapa.keys.first);
+    _mapa[id] = bytes;
+  }
+}
+
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
   @override
@@ -102,11 +121,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _calculando = false;
   int _lidos = 0;
 
-  // Ordenação cacheada: ordenar 19 mil itens a cada build (e tem build a cada
-  // conclusão e a cada tick de 15s) era jank de horas. Recalcula só quando a
-  // ordem ou os dados mudam; o filtro em cima é O(n) barato.
+  // Onboarding: null = ainda lendo a flag; false = mostrar; true = já viu.
+  bool? _viuOnboarding;
+
+  // Ordenação cacheada: ordenar 19 mil itens a cada build era jank de horas.
   List<MediaItem>? _ordenadoCache;
   String _ordenadoChave = '';
+
+  // Soma de bytes cacheada pro card de missão.
+  int _bytesNoCelular = 0;
+  int _seguroCache = 0;
+  String _seguroChave = '';
 
   final GoogleSignIn _gsi = GoogleSignIn(
     scopes: ['https://www.googleapis.com/auth/drive.file'],
@@ -126,11 +151,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   StreamSubscription<TaskUpdate>? _sub;
 
   // Janela deslizante guiada pelo banco da biblioteca (a fonte da verdade).
-  //
-  // Rodada 8: janela de 6 pra 40. A janela pequena tinha um custo escondido:
-  // se o Android mata o app, só o que já está no motor termina. Com 40, um
-  // kill de madrugada ainda deixa horas de upload andando sozinho. O preparo
-  // continua em levas de 6 por vez pra não abrir 40 arquivos de uma vez.
   static const int _janela = 40;
   static const int _concorrenciaPreparo = 6;
   final List<ItemBackup> _pendentes = []; // ainda não enfileirados
@@ -140,6 +160,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _alimentando = false; // trava de reentrância (parte lenta)
   Timer? _poll; // sincroniza com o banco a cada 15s
 
+  // Duplicatas exatas: id do principal -> itens cobertos por ele.
+  final Map<String, List<ItemBackup>> _dupsDe = {};
+
   // Info do MediaStore (canal nativo): bytes e caminho real por id.
   Map<String, MidiaNativa> _midiaInfo = {};
 
@@ -147,24 +170,39 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final Map<String, int> _bytesPorId = {};
   final List<(DateTime, int)> _amostras = []; // (quando, bytes concluídos)
 
+  // Sessão atual: pra telemetria e pro diálogo de vitória (1 vez só).
+  DateTime? _inicioSessao;
+  bool _celebrado = false;
+  DateTime _ultimaNotif = DateTime.fromMillisecondsSinceEpoch(0);
+
+  // Integridade: MD5 conferido até este tamanho (acima disso, vale o tamanho).
+  static const int _tetoMd5 = 256 * 1024 * 1024;
+
   int get _bgTotal => _emFila.length;
   int get _bgFeitos => _emFila.where(_enviadosIds.contains).length;
+
+  /// Bytes já seguros no Drive E ainda presentes no celular (o que dá pra
+  /// liberar). Cacheado por revisão barata.
+  int get _bytesSeguros {
+    final chave = '${_enviadosIds.length}|${_items.length}';
+    if (chave != _seguroChave) {
+      _seguroCache = _items
+          .where((m) => _enviadosIds.contains(m.asset.id))
+          .fold(0, (s, m) => s + m.bytes);
+      _seguroChave = chave;
+    }
+    return _seguroCache;
+  }
 
   // ---------------------------------------------------------------------------
   // Motor: reconciliar (barato, roda sempre) + alimentar (lento, com trava)
   // ---------------------------------------------------------------------------
 
-  /// Tick do motor: reconcilia com o banco e depois repõe a janela. Separados
-  /// de propósito: antes uma trava única segurava a reconciliação enquanto um
-  /// preparo lento rodava, e a janela secava esperando o próximo tick.
   Future<void> _tick() async {
     await _reconciliar();
     await _alimentar();
   }
 
-  /// Pergunta ao banco da biblioteca o que está ativo e o que concluiu, e
-  /// atualiza a contagem. Não depende de capturar todo evento ao vivo (que se
-  /// perde em job longo): o banco é a fonte da verdade.
   Future<void> _reconciliar() async {
     if (_reconciliando || _conta == null || _emFila.isEmpty) return;
     _reconciliando = true;
@@ -182,6 +220,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _emAndamento
         ..clear()
         ..addAll(ativos);
+      _notificarProgresso();
       if (mounted) setState(() {});
     } catch (_) {
       // silencioso: tenta de novo no próximo tick
@@ -190,23 +229,114 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  /// Marca um arquivo como confirmado no Drive: store (linha em append),
-  /// contagem, velocidade e limpeza do registro no banco da biblioteca.
-  Future<void> _confirmarEnvio(String id, String? fileId, int? bytes) async {
+  /// Marca um arquivo como confirmado no Drive: store, contagem, velocidade,
+  /// cobertura das duplicatas e limpeza do registro no banco da biblioteca.
+  Future<void> _confirmarEnvio(String id, String? fileId, int? bytes,
+      {bool contarVelocidade = true}) async {
     if (_enviadosIds.contains(id)) return;
     final b = bytes ?? _bytesPorId[id] ?? 0;
     await _store.marcarEnviado(id, fileId: fileId, bytes: b > 0 ? b : null);
     _enviadosIds.add(id);
     _emAndamento.remove(id);
-    if (_emFila.contains(id) && b > 0) {
+    if (contarVelocidade && _emFila.contains(id) && b > 0) {
       _amostras.add((DateTime.now(), b));
     }
-    // Banco da biblioteca não precisa mais desse registro (o nosso store é a
-    // fonte). Sem essa limpeza o banco cresce sem limite e o boot fica lento.
     await BackupService.limparRegistro(id);
+    // Duplicatas exatas cobertas por este arquivo: mesmo fileId no Drive.
+    final cobertos = _dupsDe[id];
+    if (cobertos != null) {
+      for (final cob in cobertos) {
+        if (_enviadosIds.contains(cob.id)) continue;
+        await _store.marcarEnviado(cob.id,
+            fileId: fileId, bytes: cob.bytes > 0 ? cob.bytes : null);
+        _enviadosIds.add(cob.id);
+      }
+    }
+    _notificarProgresso();
+    _checarConclusao();
   }
 
-  /// Repõe a janela: pega pendentes, prepara em levas de 6 e enfileira.
+  /// A sessão acabou de completar? Celebra (1 vez), registra a telemetria e
+  /// limpa a notificação de progresso.
+  void _checarConclusao() {
+    if (_celebrado || _inicioSessao == null || _emFila.isEmpty) return;
+    if (_bgFeitos < _bgTotal) return;
+    _celebrado = true;
+    Nativo.limparNotificacao();
+    BackupService.invalidarListagem(); // subiu coisa nova; a listagem mudou
+    var bytesTotal = 0;
+    for (final id in _emFila) {
+      bytesTotal += _bytesPorId[id] ?? 0;
+    }
+    _store.registrarSessao({
+      'inicio': _inicioSessao!.toIso8601String(),
+      'fim': DateTime.now().toIso8601String(),
+      'arquivos': _bgTotal,
+      'bytes': bytesTotal,
+      'falhas': _falhasBg,
+      'ultimoErro': _erroBg,
+    });
+    if (mounted) _mostrarVitoria(_bgTotal, bytesTotal);
+  }
+
+  void _mostrarVitoria(int arquivos, int bytes) {
+    final liberaveis = _bytesSeguros;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Backup concluído!'),
+        content: Text(
+            '$arquivos arquivos (${_fmt(bytes)}) estão seguros no Drive.\n\n'
+            '${liberaveis > 0 ? 'Agora dá pra liberar ${_fmt(liberaveis)} do celular.' : ''}'),
+        actions: [
+          TextButton(
+            onPressed: () => Nativo.compartilhar(
+                'Acabei de guardar $arquivos fotos e vídeos (${_fmt(bytes)}) na nuvem e liberar espaço no celular com o Limpa Memória.'),
+            child: const Text('Compartilhar'),
+          ),
+          if (liberaveis > 0)
+            FilledButton(
+              onPressed: () {
+                Navigator.pop(ctx);
+                _apagarEnviados();
+              },
+              child: Text('Liberar ${_fmt(liberaveis)}'),
+            )
+          else
+            TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Fechar')),
+        ],
+      ),
+    );
+  }
+
+  /// Notificação do sistema com o número REAL ("4.312 de 19.000") e barra.
+  /// Atualizada no máximo a cada 3s pra não afogar o NotificationManager.
+  void _notificarProgresso() {
+    if (_emFila.isEmpty || _inicioSessao == null) return;
+    final total = _bgTotal;
+    final feitos = _bgFeitos;
+    if (feitos >= total || _pausado) {
+      Nativo.limparNotificacao();
+      return;
+    }
+    final agora = DateTime.now();
+    if (agora.difference(_ultimaNotif).inSeconds < 3) return;
+    _ultimaNotif = agora;
+    var restante = 0;
+    for (final id in _emFila) {
+      if (!_enviadosIds.contains(id)) restante += _bytesPorId[id] ?? 0;
+    }
+    final eta = _eta(restante);
+    Nativo.notificar(
+      'Backup: $feitos de $total',
+      eta.isNotEmpty ? '$eta · deixe o app aberto na tomada' : 'Subindo…',
+      feitos,
+      total,
+    );
+  }
+
   Future<void> _alimentar() async {
     if (_alimentando || _conta == null || _pausado || _emFila.isEmpty) return;
     _alimentando = true;
@@ -215,7 +345,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       final lote = <ItemBackup>[];
       while (lote.length < vagas && _pendentes.isNotEmpty) {
         final item = _pendentes.removeAt(0);
-        if (_enviadosIds.contains(item.id) ||
+        if (item.dup.isNotEmpty ||
+            _enviadosIds.contains(item.id) ||
             _emAndamento.contains(item.id) ||
             lote.any((e) => e.id == item.id)) {
           continue;
@@ -224,12 +355,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       }
       if (lote.isEmpty) return;
 
-      // Pré-cria as subpastas da leva ANTES do paralelo, senão dois uploads
-      // da mesma pasta nova criariam a pasta duas vezes no Drive.
       await BackupService.garantirSubpastas(_gsi, lote.map((e) => e.pasta));
 
-      // Prepara em levas de 6: paralelo o bastante pra rede não ficar ociosa,
-      // sem abrir dezenas de arquivos grandes ao mesmo tempo.
       for (var i = 0; i < lote.length; i += _concorrenciaPreparo) {
         if (_pausado) {
           _pendentes.insertAll(0, lote.sublist(i));
@@ -275,10 +402,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  /// Drive sem espaço no meio do job: pausa sozinho com recado claro, em vez
-  /// de queimar retentativas arquivo por arquivo com erro genérico.
   Future<void> _pausarPorDriveCheio() async {
     await _store.setPausado(true);
+    Nativo.limparNotificacao();
     if (mounted) {
       setState(() {
         _pausado = true;
@@ -287,6 +413,173 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             'O Drive encheu. Libere espaço na conta (ou assine mais) e toque em Retomar.';
       });
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Caminho feliz: missão, sugestões e fechamento do ciclo
+  // ---------------------------------------------------------------------------
+
+  /// Card no topo: o resumo da missão e os 2 botões que resolvem a jornada.
+  Widget _cardMissao() {
+    if (_items.isEmpty) return const SizedBox.shrink();
+    final subindo = _emFila.isNotEmpty && _bgFeitos < _bgTotal;
+    if (subindo) return const SizedBox.shrink(); // durante o backup, o banner manda
+    final liberaveis = _bytesSeguros;
+    final foraDrive = _bytesNoCelular - liberaveis;
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: _parchment,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Seu celular tem ${_fmt(_bytesNoCelular)} em fotos e vídeos',
+            style: const TextStyle(
+                fontSize: 16, fontWeight: FontWeight.w600, color: _ink),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            liberaveis > 0
+                ? '${_fmt(liberaveis)} já estão seguros no Drive e podem sair do celular. ${foraDrive > 0 ? '${_fmt(foraDrive)} ainda estão só aqui.' : ''}'
+                : '${_fmt(foraDrive)} ainda estão só no celular.',
+            style: const TextStyle(fontSize: 13, color: _inkMuted),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              FilledButton(
+                onPressed: _abrirSugestoes,
+                child: const Text('Liberar espaço'),
+              ),
+              const SizedBox(width: 8),
+              if (liberaveis > 0)
+                TextButton(
+                  onPressed: _apagarEnviados,
+                  child: Text('Apagar ${_fmt(liberaveis)} seguros'),
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Sugestões de seleção (estilo Files by Google): grupos prontos com o
+  /// quanto cada um libera. Heurísticas baratas de pasta, tamanho e data.
+  Future<void> _abrirSugestoes() async {
+    final agora = DateTime.now();
+    final umAno = agora.subtract(const Duration(days: 365));
+    final fora =
+        _items.where((m) => !_enviadosIds.contains(m.asset.id)).toList();
+
+    List<MediaItem> grupo(bool Function(MediaItem) f) => fora.where(f).toList();
+    final grupos = <(String, String, List<MediaItem>)>[];
+    void add(String titulo, String desc, List<MediaItem> itens) {
+      if (itens.isNotEmpty) grupos.add((titulo, desc, itens));
+    }
+
+    add(
+        'Vídeos grandes',
+        'Acima de 100 MB',
+        grupo((m) =>
+            m.asset.type == AssetType.video && m.bytes > 100 * 1024 * 1024));
+    add('WhatsApp', 'Fotos e vídeos recebidos',
+        grupo((m) => m.pasta.toLowerCase().contains('whatsapp')));
+    add('Mais antigos que 1 ano', 'Você quase não abre',
+        grupo((m) => m.asset.createDateTime.isBefore(umAno)));
+    add('Screenshots', 'Capturas de tela',
+        grupo((m) => m.pasta.toLowerCase().contains('screenshot')));
+
+    if (grupos.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text(
+              'Nada óbvio pra sugerir: tudo que sobrou é recente e pequeno. Use a lista pra escolher.')));
+      return;
+    }
+    if (_conta == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Entre com o Google primeiro (ícone lá em cima).')));
+      return;
+    }
+
+    final marcados = <int>{for (var i = 0; i < grupos.length; i++) i};
+    if (!mounted) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheet) {
+          final selecionados = <MediaItem>{};
+          for (final i in marcados) {
+            selecionados.addAll(grupos[i].$3);
+          }
+          final bytes = selecionados.fold<int>(0, (s, m) => s + m.bytes);
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('O que guardar no Drive?',
+                      style:
+                          TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 4),
+                  const Text(
+                      'Sugestões prontas. Desmarque o que quiser manter só no celular.',
+                      style: TextStyle(fontSize: 13, color: _inkMuted)),
+                  const SizedBox(height: 8),
+                  ...List.generate(grupos.length, (i) {
+                    final (titulo, desc, itens) = grupos[i];
+                    final gb =
+                        itens.fold<int>(0, (s, m) => s + m.bytes);
+                    return CheckboxListTile(
+                      value: marcados.contains(i),
+                      onChanged: (v) => setSheet(() {
+                        if (v == true) {
+                          marcados.add(i);
+                        } else {
+                          marcados.remove(i);
+                        }
+                      }),
+                      title: Text(titulo),
+                      subtitle: Text(
+                          '$desc · ${itens.length} arquivos · ${_fmt(gb)}'),
+                      contentPadding: EdgeInsets.zero,
+                    );
+                  }),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton(
+                      onPressed: selecionados.isEmpty
+                          ? null
+                          : () {
+                              Navigator.pop(ctx);
+                              setState(() {
+                                _selected
+                                  ..clear()
+                                  ..addAll(selecionados);
+                              });
+                              _subir();
+                            },
+                      child: Text(selecionados.isEmpty
+                          ? 'Nada marcado'
+                          : 'Subir ${selecionados.length} arquivos (${_fmt(bytes)})'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -389,8 +682,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             : 'Qualquer rede: sobe no wifi e em dados móveis.')));
   }
 
-  /// Backup grande: sugere tomada e pede a isenção de bateria do Android, que
-  /// é o que impede o Doze de matar o job de madrugada.
   Future<void> _prepararJobGrande(int precisa) async {
     if (precisa < 5 * 1024 * 1024 * 1024) return;
     final isenta = await Nativo.bateriaIsenta();
@@ -421,9 +712,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  /// Não cabe tudo no Drive: oferece subir só o que cabe, priorizando os
-  /// maiores (liberam mais espaço no celular). Devolve a lista aparada, ou
-  /// null se o usuário cancelou.
   Future<List<ItemBackup>?> _apararPraCaber(
       List<ItemBackup> pendentes, int precisa, int livre) async {
     const margem = 200 * 1024 * 1024; // 200 MB de folga
@@ -460,9 +748,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return cabem;
   }
 
-  /// Reinstalou o app? O store zera, mas o backup continua no Drive. O escopo
-  /// drive.file enxerga o que o próprio app criou, então dá pra reconhecer o
-  /// que já subiu (por nome + pasta + tamanho) e não duplicar nada.
   Future<void> _reconhecerBackupAntigo() async {
     if (_enviadosIds.isNotEmpty) return;
     final noDrive = await BackupService.listarNoDrive(_gsi);
@@ -496,8 +781,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return;
     }
 
-    // Prepara o contexto (token + pasta principal) logo, porque a
-    // reconciliação de backup antigo também precisa dele.
     final (ok, erroCtx) = await BackupService.prepararContexto(_gsi);
     if (!ok) {
       if (!mounted) return;
@@ -516,13 +799,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return;
     }
 
-    // Primeira vez com store vazio: confere se já existe backup no Drive
-    // (caso reinstalação) antes de decidir o que sobe.
     await _reconhecerBackupAntigo();
 
-    // Os selecionados viram itens (com caminho real e bytes do MediaStore).
-    // A sessão (job) é MESCLADA, nunca reescrita menor: é o que mantém o
-    // total da barra estável do começo ao fim.
     final selecionados = _selected
         .map((m) => ItemBackup(m.asset.id, m.asset.title ?? 'sem nome', m.pasta,
             path: m.path, bytes: m.bytes))
@@ -543,7 +821,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
     var mergedItens = mapa.values.map(ItemBackup.fromMap).toList();
 
-    // O que ainda falta subir nesta sessão.
     var pendentesItens =
         mergedItens.where((it) => !_enviadosIds.contains(it.id)).toList();
     if (pendentesItens.isEmpty) {
@@ -553,25 +830,55 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return;
     }
 
-    // Checa espaço. Se não cabe, oferece subir só o que cabe.
-    final precisa = pendentesItens.fold<int>(0, (s, it) => s + it.bytes);
+    // Duplicatas exatas (mesmo nome + mesmo tamanho, clássico do WhatsApp):
+    // sobe 1, as outras são cobertas pelo mesmo arquivo do Drive.
+    final porChaveDup = <String, ItemBackup>{};
+    var duplicatas = 0;
+    pendentesItens = pendentesItens.map((it) {
+      if (it.bytes <= 0 || it.dup.isNotEmpty) return it;
+      final chave = '${it.titulo}|${it.bytes}';
+      final principal = porChaveDup[chave];
+      if (principal == null) {
+        porChaveDup[chave] = it;
+        return it;
+      }
+      duplicatas++;
+      return ItemBackup(it.id, it.titulo, it.pasta,
+          path: it.path, bytes: it.bytes, dup: principal.id);
+    }).toList();
+
+    // Checa espaço: só o que de fato sobe (duplicata coberta não conta).
+    final precisa = pendentesItens
+        .where((it) => it.dup.isEmpty)
+        .fold<int>(0, (s, it) => s + it.bytes);
     final livre = await BackupService.espacoLivre(_gsi);
     if (livre != null && precisa > livre) {
-      final aparados = await _apararPraCaber(pendentesItens, precisa, livre);
+      final soSobem =
+          pendentesItens.where((it) => it.dup.isEmpty).toList();
+      final aparados = await _apararPraCaber(soSobem, precisa, livre);
       if (aparados == null || aparados.isEmpty) return;
-      pendentesItens = aparados;
       final idsAparados = aparados.map((e) => e.id).toSet();
-      mergedItens = mergedItens
-          .where((it) =>
-              _enviadosIds.contains(it.id) || idsAparados.contains(it.id))
+      // Ficam: os aparados + as duplicatas cujo principal ficou.
+      pendentesItens = pendentesItens
+          .where((it) => it.dup.isEmpty
+              ? idsAparados.contains(it.id)
+              : idsAparados.contains(it.dup))
           .toList();
     }
+    mergedItens = [
+      ...mergedItens.where((it) => _enviadosIds.contains(it.id)),
+      ...pendentesItens,
+    ];
 
-    // Job grande: tomada + isenção de bateria.
-    await _prepararJobGrande(pendentesItens.fold<int>(0, (s, it) => s + it.bytes));
+    await _prepararJobGrande(
+        pendentesItens.where((it) => it.dup.isEmpty).fold<int>(0, (s, it) => s + it.bytes));
+
+    // Maiores primeiro: libera mais espaço mais cedo.
+    pendentesItens.sort((a, b) => b.bytes.compareTo(a.bytes));
 
     await _store.salvarJob(mergedItens.map((e) => e.toMap()).toList());
     await _store.setPausado(false);
+    BackupService.invalidarListagem();
 
     if (mounted) {
       setState(() {
@@ -582,29 +889,50 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         _erroBg = null;
         _tentativas.clear();
         _amostras.clear();
+        _inicioSessao = DateTime.now();
+        _celebrado = false;
         _emFila
           ..clear()
           ..addAll(mergedItens.map((e) => e.id));
         _bytesPorId
           ..clear()
           ..addEntries(mergedItens.map((e) => MapEntry(e.id, e.bytes)));
+        _dupsDe.clear();
+        for (final it in mergedItens) {
+          if (it.dup.isNotEmpty) {
+            _dupsDe.putIfAbsent(it.dup, () => []).add(it);
+          }
+        }
         _pendentes
           ..clear()
-          ..addAll(pendentesItens);
+          ..addAll(pendentesItens.where((it) => it.dup.isEmpty));
       });
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+      // Duplicata cujo principal JÁ está no Drive: cobre agora, senão a
+      // contagem da sessão nunca fecharia esperando um upload que não existe.
+      for (final entry in _dupsDe.entries) {
+        if (!_enviadosIds.contains(entry.key)) continue;
+        final fileId = _store.envioDe(entry.key)?.fileId;
+        for (final cob in entry.value) {
+          if (_enviadosIds.contains(cob.id)) continue;
+          await _store.marcarEnviado(cob.id,
+              fileId: fileId, bytes: cob.bytes > 0 ? cob.bytes : null);
+          _enviadosIds.add(cob.id);
+        }
+      }
+      final msgDup = duplicatas > 0
+          ? ' $duplicatas duplicatas sobem 1 vez só (poupa Drive).'
+          : '';
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           content: Text(
-              'Backup começou. Deixe o app aberto na tomada pra ir até o fim sem parar.')));
+              'Backup começou. Deixe o app aberto na tomada pra ir até o fim.$msgDup')));
     }
 
     _tick();
   }
 
-  /// Para o backup: deixa de alimentar a janela (o que já estava subindo
-  /// termina sozinho) e limpa os pendentes. O job fica salvo, então o Retomar
-  /// reconstrói o que falta sem re-subir nada.
   Future<void> _parar() async {
     await _store.setPausado(true);
+    Nativo.limparNotificacao();
     if (mounted) {
       setState(() {
         _pausado = true;
@@ -633,7 +961,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  /// Devolve os que falharam de vez pra fila, com contador zerado.
   Future<void> _tentarFalhosDeNovo() async {
     if (_falhos.isEmpty) return;
     setState(() {
@@ -649,7 +976,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   // ---------------------------------------------------------------------------
-  // Apagar do celular (agora com conferência real no Drive)
+  // Apagar do celular (com conferência real no Drive)
   // ---------------------------------------------------------------------------
 
   Future<void> _apagarEnviados() async {
@@ -683,9 +1010,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
     if (confirma != true) return;
 
-    // Conferência real: lista o que existe no Drive e só apaga o que bater
-    // por fileId + tamanho (ou nome + pasta + tamanho, pros envios antigos
-    // que ainda não guardavam fileId).
     if (!mounted) return;
     showDialog(
       context: context,
@@ -731,7 +1055,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         final chave = '${item.asset.title ?? ''}|${item.pasta}|${item.bytes}';
         final quantos = porChave[chave] ?? 0;
         if (quantos > 0) {
-          porChave[chave] = quantos - 1; // consome, pra não validar 2 locais com 1 do Drive
+          porChave[chave] = quantos - 1;
           ok = true;
         }
       }
@@ -750,7 +1074,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return;
     }
 
-    // Apaga em LOTES de 800 (mais que isso estoura o limite do Android).
     const tamLote = 800;
     final List<String> apagadosAll = [];
     for (var i = 0; i < verificados.length; i += tamLote) {
@@ -776,6 +1099,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _selected.removeWhere((m) => setApagados.contains(m.asset.id));
       _emFila.removeAll(setApagados);
       _ordenadoCache = null;
+      _seguroChave = '';
+      _bytesNoCelular = _items.fold(0, (s, m) => s + m.bytes);
       final Map<String, List<MediaItem>> grupos = {};
       for (final it in _items) {
         grupos.putIfAbsent(it.pasta, () => []).add(it);
@@ -797,11 +1122,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _boot();
+    _poll = Timer.periodic(const Duration(seconds: 15), (_) => _tick());
+  }
+
+  /// Decide entre onboarding e o app. O motor e a galeria só sobem depois que
+  /// o onboarding foi visto (é ele que explica as permissões que vêm a seguir).
+  Future<void> _boot() async {
+    await _store.init(await Nativo.dirDados());
+    final viu = await _store.viuOnboarding();
+    if (!mounted) return;
+    if (!viu) {
+      setState(() => _viuOnboarding = false);
+      return;
+    }
+    setState(() => _viuOnboarding = true);
     _iniciarBackupEngine();
     _load();
-    // Rede de segurança: a cada 15s reconcilia com o banco e repõe a janela,
-    // mesmo que algum evento ao vivo tenha se perdido.
-    _poll = Timer.periodic(const Duration(seconds: 15), (_) => _tick());
+  }
+
+  Future<void> _concluirOnboarding() async {
+    await _store.marcarOnboardingVisto();
+    if (!mounted) return;
+    setState(() => _viuOnboarding = true);
+    _iniciarBackupEngine();
+    _load();
   }
 
   @override
@@ -815,7 +1160,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // Indo pro fundo ou fechando: garante o flush do progresso no disco.
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.inactive ||
         state == AppLifecycleState.detached) {
@@ -824,19 +1168,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _iniciarBackupEngine() async {
-    // O store agora vive em arquivos na pasta de dados do app (aguenta 30 mil
-    // ids sem reescrever tudo a cada gravação). Init ANTES de qualquer leitura.
-    await _store.init(await Nativo.dirDados());
+    await _store.init(await Nativo.dirDados()); // idempotente
 
     await BackupService.configurar();
-    // Listener PRIMEIRO: o iniciarMotor() reprocessa o que terminou em segundo
-    // plano, e sem o listener no ar essas conclusões se perderiam.
     _sub = FileDownloader().updates.listen(_onUpdate);
     await BackupService.iniciarMotor();
 
-    // Reconcilia com o banco da biblioteca: tudo que consta como concluído
-    // (até o que subiu com o app fechado) entra nos enviados, e o registro
-    // reconciliado sai do banco (mantém o banco pequeno e o boot rápido).
     final concluidos = await BackupService.concluidosNoBanco();
     for (final id in concluidos) {
       await _store.marcarEnviado(id);
@@ -844,13 +1181,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
     await _store.gravarAgora();
 
-    // Limpeza única da fila herdada das builds antigas.
     if (await _store.precisaLimparFila()) {
       await BackupService.limparFilaLegada();
       await _store.marcarFilaLimpa();
     }
 
-    // Restaura o login da última vez (sem pedir nada), pra retomar sozinho.
     try {
       final conta = await _gsi.signInSilently();
       if (conta != null && mounted) setState(() => _conta = conta);
@@ -876,12 +1211,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         }
       });
     }
-    // Retoma sozinho na janela (a não ser que o usuário tenha pausado).
     _retomarJanela(job);
   }
 
-  // Resposta rápida a um evento ao vivo. A rede de segurança é o tick de 15s
-  // guiado pelo banco da biblioteca.
   void _onUpdate(TaskUpdate update) async {
     if (update is! TaskStatusUpdate ||
         update.task.group != BackupService.grupo) {
@@ -889,13 +1221,43 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
     final id = update.task.taskId;
     if (update.status == TaskStatus.complete) {
-      // A resposta final do Drive traz o fileId e o tamanho: é a prova que a
-      // conferência antes de apagar usa.
-      final (fileId, bytes) =
+      final (fileId, bytes, md5Drive) =
           BackupService.extrairArquivoDaResposta(update.responseBody);
+      final meta = MetaTarefa.decodificar(update.task.metaData);
+      final b = bytes ?? meta.bytes;
+
+      // Integridade: confere o MD5 local contra o que o Drive calculou.
+      // Só até 256 MB (acima disso o custo de reler o arquivo não compensa;
+      // a conferência de tamanho segue valendo). Divergiu = refaz o upload.
+      if (md5Drive != null && b > 0 && b <= _tetoMd5) {
+        try {
+          final caminho = await update.task.filePath();
+          final md5Local = await Nativo.md5(caminho);
+          if (md5Local != null && md5Local != md5Drive) {
+            await BackupService.apagarCopiaDeCache(update.task);
+            if (fileId != null) BackupService.apagarNoDrive(_gsi, fileId);
+            final t = (_tentativas[id] ?? 0) + 1;
+            _tentativas[id] = t;
+            final item = ItemBackup(id, update.task.filename, meta.pasta,
+                bytes: meta.bytes);
+            if (t <= 3) {
+              _pendentes.add(item);
+              _erroBg = 'Um arquivo chegou diferente no Drive; refazendo.';
+            } else {
+              _falhasBg++;
+              _falhos.add(item);
+              _erroBg = '"${update.task.filename}" chegou corrompido 3 vezes.';
+            }
+            if (mounted) setState(() {});
+            _tick();
+            return;
+          }
+        } catch (_) {
+          // sem MD5 não bloqueia: a conferência de tamanho continua valendo
+        }
+      }
+
       await _confirmarEnvio(id, fileId, bytes);
-      // Se o arquivo local era uma cópia no cache do app, apaga (senão o cache
-      // cresce até o tamanho do backup num celular que já está cheio).
       await BackupService.apagarCopiaDeCache(update.task);
       if (mounted) setState(() {});
       _tick();
@@ -905,7 +1267,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       final exc = update.exception;
       final quota = exc is TaskHttpException && exc.httpResponseCode == 403;
       if (quota) {
-        // 403 na URL da sessão (que dispensa auth) é cota estourada.
         final meta = MetaTarefa.decodificar(update.task.metaData);
         _pendentes.insert(
             0,
@@ -923,8 +1284,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           t <= 3 &&
           _emFila.contains(id) &&
           !_enviadosIds.contains(id)) {
-        // Falhou mesmo depois das retentativas internas: tenta de novo com
-        // uma sessão nova, no fim da fila.
         _pendentes.add(item);
       } else if (mounted) {
         setState(() {
@@ -940,21 +1299,41 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Future<void> _retomarJanela(List<Map<String, String>> job) async {
     if (job.isEmpty || _conta == null || _pausado) return;
-    // Espera o motor restaurar a fila nativa antes de decidir o que falta.
     await Future.delayed(const Duration(seconds: 3));
     final enviados = await _store.enviados(); // leitura fresca
-    final pendentes = job
-        .where((m) {
-          final id = m['id'] ?? '';
-          return id.isNotEmpty && !enviados.contains(id);
-        })
-        .map(ItemBackup.fromMap)
-        .toList();
+    final itens = job.map(ItemBackup.fromMap).toList();
+
+    // Reconstrói o mapa de duplicatas e cobre as que o principal já pagou.
+    _dupsDe.clear();
+    for (final it in itens) {
+      if (it.dup.isNotEmpty) _dupsDe.putIfAbsent(it.dup, () => []).add(it);
+    }
+    for (final entry in _dupsDe.entries) {
+      if (!enviados.contains(entry.key)) continue;
+      final fileId = _store.envioDe(entry.key)?.fileId;
+      for (final cob in entry.value) {
+        if (enviados.contains(cob.id)) continue;
+        await _store.marcarEnviado(cob.id,
+            fileId: fileId, bytes: cob.bytes > 0 ? cob.bytes : null);
+        enviados.add(cob.id);
+        _enviadosIds.add(cob.id);
+      }
+    }
+
+    final pendentes = itens
+        .where((it) =>
+            it.id.isNotEmpty &&
+            it.dup.isEmpty &&
+            !enviados.contains(it.id))
+        .toList()
+      ..sort((a, b) => b.bytes.compareTo(a.bytes)); // maiores primeiro
     if (!mounted) return;
+    if (pendentes.isEmpty) return;
     final (ok, _) = await BackupService.prepararContexto(_gsi);
     if (!ok) return;
     if (!mounted) return;
     setState(() {
+      _inicioSessao ??= DateTime.now(); // sessão retomada conta como ativa
       _pendentes
         ..clear()
         ..addAll(pendentes);
@@ -989,12 +1368,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final all = paths.first;
     final count = await all.assetCountAsync;
 
-    // Uma consulta só ao MediaStore traz tamanho e caminho de tudo. Acaba com
-    // o "ler arquivo por arquivo" que custava minutos na primeira abertura.
     final infoFut = Nativo.midias();
 
-    // Pagina a listagem: a primeira tela aparece em segundos mesmo com 19 mil
-    // arquivos, em vez de esperar um platform-call gigante.
     const pagina = 1000;
     final List<MediaItem> items = [];
     for (var inicio = 0; inicio < count; inicio += pagina) {
@@ -1040,13 +1415,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _pastas = pastas;
       _status = '${items.length} arquivos';
       _ordenadoCache = null;
+      _seguroChave = '';
+      _bytesNoCelular = items.fold(0, (s, m) => s + m.bytes);
       _calculando = faltam > 0;
       _lidos = items.length - faltam;
     });
     if (faltam > 0) _calcularTamanhosFallback();
   }
 
-  /// Fallback raro: mede só o que o MediaStore não devolveu (bytes == 0).
   Future<void> _calcularTamanhosFallback() async {
     final pendentes = _items.where((it) => it.bytes == 0).toList();
     final base = _items.length - pendentes.length;
@@ -1069,8 +1445,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       }
     }
     if (novos.isNotEmpty) await _store.salvarTamanhos(novos);
-    // O fallback pode ter deixado cópias no cache do photo_manager: limpa,
-    // desde que nenhum upload esteja usando uma cópia agora.
     if (_emAndamento.isEmpty) {
       try {
         await PhotoManager.clearFileCache();
@@ -1081,6 +1455,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _lidos = _items.length;
       _calculando = false;
       _ordenadoCache = null;
+      _seguroChave = '';
+      _bytesNoCelular = _items.fold(0, (s, m) => s + m.bytes);
       _pastas.sort((a, b) => b.bytes.compareTo(a.bytes));
     });
   }
@@ -1135,11 +1511,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   int get _totalSelecionado => _selected.fold(0, (s, i) => s + i.bytes);
 
-  void _toggle(MediaItem item, bool? v) => setState(() {
-        if (v == true) {
-          _selected.add(item);
-        } else {
+  void _toggle(MediaItem item) => setState(() {
+        if (_selected.contains(item)) {
           _selected.remove(item);
+        } else {
+          _selected.add(item);
         }
       });
 
@@ -1159,7 +1535,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // Velocidade e estimativa
   // ---------------------------------------------------------------------------
 
-  /// Bytes por segundo na média dos últimos 5 minutos. 0 = sem dado ainda.
   double get _velocidade {
     final agora = DateTime.now();
     _amostras.removeWhere((a) => agora.difference(a.$1).inSeconds > 300);
@@ -1187,6 +1562,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    if (_viuOnboarding == null) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    if (_viuOnboarding == false) {
+      return OnboardingPage(
+        conta: _conta,
+        onLogin: _login,
+        onConcluir: _concluirOnboarding,
+      );
+    }
     return DefaultTabController(
       length: 2,
       child: Scaffold(
@@ -1249,12 +1634,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                         style: const TextStyle(color: _inkMuted, fontSize: 14),
                       ),
                     ),
-                  ] else
-                    const Padding(
-                      padding: EdgeInsets.fromLTRB(16, 12, 16, 4),
-                      child: Text('Todas as mídias lidas com sucesso',
-                          style: TextStyle(color: _inkMuted, fontSize: 14)),
-                    ),
+                  ],
+                  _cardMissao(),
                   _bannerBackup(),
                   Expanded(
                     child: TabBarView(children: [_abaMidias(), _abaPastas()]),
@@ -1295,8 +1676,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final feitos = _bgFeitos;
     final pronto = feitos >= total;
 
-    // Progresso por BYTES quando dá: mais honesto que contagem quando os
-    // vídeos grandes sobram pro fim. Cai pra contagem se não tem tamanho.
     var bytesTotal = 0;
     var bytesFeitos = 0;
     for (final id in _emFila) {
@@ -1310,6 +1689,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final faltam = total - feitos;
     final eta = (!pronto && !_pausado) ? _eta(bytesTotal - bytesFeitos) : '';
     final vel = _velocidade;
+    final liberaveis = _bytesSeguros;
 
     return Container(
       width: double.infinity,
@@ -1347,6 +1727,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                         onPressed: _parar,
                         icon: const Icon(Icons.stop, size: 18),
                         label: const Text('Parar')),
+              if (pronto && liberaveis > 0)
+                TextButton.icon(
+                    onPressed: _apagarEnviados,
+                    icon: const Icon(Icons.delete_outline, size: 18),
+                    label: Text('Liberar ${_fmt(liberaveis)}')),
             ],
           ),
           const SizedBox(height: 8),
@@ -1435,33 +1820,27 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                           ? 'Nada no Drive ainda.'
                           : 'Nada fora do Drive.',
                       style: const TextStyle(color: _inkMuted)))
-              : ListView.builder(
+              : GridView.builder(
+                  padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
+                  gridDelegate:
+                      const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 3,
+                    mainAxisSpacing: 4,
+                    crossAxisSpacing: 4,
+                  ),
                   itemCount: lista.length,
                   itemBuilder: (context, i) {
                     final item = lista[i];
-                    final isVideo = item.asset.type == AssetType.video;
-                    final jaSubiu = _enviadosIds.contains(item.asset.id);
-                    return ListTile(
-                      onTap: () => Navigator.push(
+                    return _CelulaMidia(
+                      item: item,
+                      selecionado: _selected.contains(item),
+                      noDrive: _enviadosIds.contains(item.asset.id),
+                      tamanho: _fmt(item.bytes),
+                      onTap: () => _toggle(item),
+                      onLongPress: () => Navigator.push(
                           context,
                           MaterialPageRoute(
                               builder: (_) => PreviewPage(item.asset))),
-                      leading: _Miniatura(asset: item.asset, isVideo: isVideo),
-                      title: Text(item.asset.title ?? 'sem nome'),
-                      subtitle: Text(jaSubiu
-                          ? '${item.pasta} • ${_fmt(item.bytes)} • no Drive'
-                          : '${item.pasta} • ${_fmt(item.bytes)}'),
-                      trailing: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          if (jaSubiu)
-                            const Icon(Icons.cloud_done,
-                                size: 18, color: _actionBlue),
-                          Checkbox(
-                              value: _selected.contains(item),
-                              onChanged: (v) => _toggle(item, v)),
-                        ],
-                      ),
                     );
                   },
                 ),
@@ -1506,36 +1885,237 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 }
 
-class _Miniatura extends StatelessWidget {
-  final AssetEntity asset;
-  final bool isVideo;
-  const _Miniatura({required this.asset, required this.isVideo});
+/// Célula da grade: miniatura cacheada, badge de tamanho, nuvem quando já
+/// subiu, círculo de seleção. Toque seleciona; segurar abre a prévia.
+class _CelulaMidia extends StatelessWidget {
+  final MediaItem item;
+  final bool selecionado;
+  final bool noDrive;
+  final String tamanho;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+  const _CelulaMidia({
+    required this.item,
+    required this.selecionado,
+    required this.noDrive,
+    required this.tamanho,
+    required this.onTap,
+    required this.onLongPress,
+  });
+
   @override
   Widget build(BuildContext context) {
+    final isVideo = item.asset.type == AssetType.video;
+    return GestureDetector(
+      onTap: onTap,
+      onLongPress: onLongPress,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          _Thumb(id: item.asset.id, asset: item.asset, isVideo: isVideo),
+          if (selecionado)
+            Container(color: _actionBlue.withValues(alpha: 0.28)),
+          if (isVideo)
+            const Center(
+                child: Icon(Icons.play_circle_fill,
+                    color: Colors.white70, size: 28)),
+          Positioned(
+            left: 4,
+            bottom: 4,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+              decoration: BoxDecoration(
+                color: Colors.black54,
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: Text(tamanho,
+                  style: const TextStyle(color: Colors.white, fontSize: 10)),
+            ),
+          ),
+          if (noDrive)
+            const Positioned(
+              left: 4,
+              top: 4,
+              child: Icon(Icons.cloud_done, color: Colors.white, size: 16),
+            ),
+          Positioned(
+            right: 4,
+            top: 4,
+            child: Icon(
+              selecionado ? Icons.check_circle : Icons.circle_outlined,
+              color: selecionado ? _actionBlue : Colors.white70,
+              size: 20,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Miniatura com cache LRU: o mesmo Uint8List devolvido faz o Flutter
+/// reaproveitar a decodificação, sem refazer thumb a cada rebuild.
+class _Thumb extends StatelessWidget {
+  final String id;
+  final AssetEntity asset;
+  final bool isVideo;
+  const _Thumb({required this.id, required this.asset, required this.isVideo});
+
+  @override
+  Widget build(BuildContext context) {
+    final emCache = _ThumbCache.pegar(id);
+    if (emCache != null) {
+      return Image.memory(emCache, fit: BoxFit.cover, gaplessPlayback: true);
+    }
     return FutureBuilder<Uint8List?>(
-      future: asset.thumbnailDataWithSize(const ThumbnailSize(120, 120)),
+      future: asset
+          .thumbnailDataWithSize(const ThumbnailSize(200, 200))
+          .then((b) {
+        if (b != null) _ThumbCache.guardar(id, b);
+        return b;
+      }),
       builder: (c, snap) {
         if (snap.data == null) {
           return Container(
-            width: 52,
-            height: 52,
             color: Colors.black12,
-            child: Icon(isVideo ? Icons.videocam : Icons.image),
+            child: Icon(isVideo ? Icons.videocam : Icons.image,
+                color: _inkMuted),
           );
         }
-        return Stack(
-          alignment: Alignment.center,
-          children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(6),
-              child: Image.memory(snap.data!,
-                  width: 52, height: 52, fit: BoxFit.cover),
-            ),
-            if (isVideo)
-              const Icon(Icons.play_circle_fill, color: Colors.white, size: 22),
-          ],
-        );
+        return Image.memory(snap.data!,
+            fit: BoxFit.cover, gaplessPlayback: true);
       },
+    );
+  }
+}
+
+/// Onboarding de 3 telas, mostrado uma vez. Explica o app, avisa das
+/// permissões que vêm a seguir e conecta o Google.
+class OnboardingPage extends StatefulWidget {
+  final GoogleSignInAccount? conta;
+  final Future<void> Function() onLogin;
+  final Future<void> Function() onConcluir;
+  const OnboardingPage({
+    super.key,
+    required this.conta,
+    required this.onLogin,
+    required this.onConcluir,
+  });
+
+  @override
+  State<OnboardingPage> createState() => _OnboardingPageState();
+}
+
+class _OnboardingPageState extends State<OnboardingPage> {
+  final PageController _pc = PageController();
+  int _pagina = 0;
+
+  @override
+  void dispose() {
+    _pc.dispose();
+    super.dispose();
+  }
+
+  Widget _tela(IconData icone, String titulo, String texto, {Widget? extra}) {
+    return Padding(
+      padding: const EdgeInsets.all(32),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icone, size: 56, color: _actionBlue),
+          const SizedBox(height: 24),
+          Text(titulo,
+              style:
+                  const TextStyle(fontSize: 24, fontWeight: FontWeight.w600)),
+          const SizedBox(height: 12),
+          Text(texto,
+              style: const TextStyle(
+                  fontSize: 16, color: _inkMuted, height: 1.4)),
+          if (extra != null) ...[const SizedBox(height: 24), extra],
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ultima = _pagina == 2;
+    return Scaffold(
+      body: SafeArea(
+        child: Column(
+          children: [
+            Expanded(
+              child: PageView(
+                controller: _pc,
+                onPageChanged: (p) => setState(() => _pagina = p),
+                children: [
+                  _tela(
+                    Icons.photo_library_outlined,
+                    'Celular cheio, memórias salvas',
+                    'O Limpa Memória guarda suas fotos e vídeos no seu Google Drive, na qualidade original, e só depois apaga do celular o que conferiu que está seguro na nuvem.',
+                  ),
+                  _tela(
+                    Icons.lock_open_outlined,
+                    'Ele vai pedir 2 permissões',
+                    'Acesso às fotos: pra listar e subir suas mídias.\n\nNotificações: pra você acompanhar o backup com a tela apagada.\n\nSó isso. Nada sai do celular além dos arquivos que VOCÊ mandar pro seu Drive.',
+                  ),
+                  _tela(
+                    Icons.cloud_outlined,
+                    'Conecte seu Google',
+                    widget.conta == null
+                        ? 'O backup vai pro Drive da sua conta Google. O app só enxerga a pasta que ele mesmo cria; o resto do seu Drive fica invisível pra ele.'
+                        : 'Conectado como ${widget.conta!.email}. Tudo pronto.',
+                    extra: widget.conta == null
+                        ? FilledButton.icon(
+                            onPressed: () async {
+                              await widget.onLogin();
+                              if (mounted) setState(() {});
+                            },
+                            icon: const Icon(Icons.login),
+                            label: const Text('Entrar com Google'),
+                          )
+                        : null,
+                  ),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(32, 0, 32, 24),
+              child: Row(
+                children: [
+                  ...List.generate(
+                    3,
+                    (i) => Container(
+                      width: 8,
+                      height: 8,
+                      margin: const EdgeInsets.only(right: 6),
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: i == _pagina ? _actionBlue : _hairline,
+                      ),
+                    ),
+                  ),
+                  const Spacer(),
+                  if (!ultima)
+                    TextButton(
+                        onPressed: widget.onConcluir,
+                        child: const Text('Pular')),
+                  const SizedBox(width: 8),
+                  FilledButton(
+                    onPressed: ultima
+                        ? widget.onConcluir
+                        : () => _pc.nextPage(
+                            duration: const Duration(milliseconds: 250),
+                            curve: Curves.easeOut),
+                    child: Text(ultima ? 'Começar' : 'Avançar'),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

@@ -58,4 +58,40 @@ class Nativo {
       return false;
     }
   }
+
+  /// MD5 de um arquivo (hex minúsculo), calculado em thread nativa.
+  /// null = não conseguiu (aí o app segue sem a checagem, não bloqueia).
+  static Future<String?> md5(String path) async {
+    try {
+      return await _canal.invokeMethod<String>('md5', {'path': path});
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Share sheet do Android com um texto.
+  static Future<void> compartilhar(String texto) async {
+    try {
+      await _canal.invokeMethod('compartilhar', {'texto': texto});
+    } catch (_) {}
+  }
+
+  /// Notificação de progresso com o número REAL da sessão.
+  static Future<void> notificar(
+      String titulo, String texto, int feitos, int total) async {
+    try {
+      await _canal.invokeMethod('notificar', {
+        'titulo': titulo,
+        'texto': texto,
+        'feitos': feitos,
+        'total': total,
+      });
+    } catch (_) {}
+  }
+
+  static Future<void> limparNotificacao() async {
+    try {
+      await _canal.invokeMethod('limparNotificacao');
+    } catch (_) {}
+  }
 }
