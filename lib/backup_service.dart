@@ -192,6 +192,13 @@ class BackupService {
     } catch (_) {}
   }
 
+  /// Cancela tarefas específicas (Parar chegou no meio de uma leva).
+  static Future<void> cancelar(Iterable<String> ids) async {
+    try {
+      await FileDownloader().cancelTasksWithIds(ids);
+    } catch (_) {}
+  }
+
   /// Fonte da verdade do que já subiu: tudo que o banco da biblioteca marca
   /// como concluído, inclusive o que terminou com o app fechado.
   static Future<Set<String>> concluidosNoBanco() async {
@@ -523,67 +530,86 @@ class BackupService {
   // Listagem e limpeza no Drive
   // ---------------------------------------------------------------------------
 
-  // Cache da listagem do Drive: apagar em 2 levas seguidas não lista 2 vezes.
-  static List<ArquivoDrive>? _cacheListagem;
-  static DateTime? _cacheListagemEm;
+  // Cache da listagem do Drive POR PASTA (rodada 11): reconhecer o que já
+  // está no Drive pra uma seleção de 1 pasta lista só aquela pasta, não as 60.
+  static List<(String, String)>? _cacheSubs; // (id, nome) das subpastas
+  static DateTime? _cacheSubsEm;
+  static final Map<String, (DateTime, List<ArquivoDrive>)> _cachePasta = {};
   static const _validadeListagem = Duration(minutes: 10);
 
-  /// Invalida o cache da listagem (chamar quando algo novo sobe).
+  /// Invalida o cache da listagem (chamar quando algo novo sobe ou é apagado).
   static void invalidarListagem() {
-    _cacheListagem = null;
-    _cacheListagemEm = null;
+    _cacheSubs = null;
+    _cacheSubsEm = null;
+    _cachePasta.clear();
   }
 
-  /// Lista TUDO que está na(s) pasta(s) Limpa Memória do Drive (subpastas e
-  /// seus arquivos), paginado. Duas serventias:
+  static bool _fresco(DateTime? em) =>
+      em != null && DateTime.now().difference(em) < _validadeListagem;
+
+  /// Lista o que está na(s) pasta(s) Limpa Memória do Drive, paginado.
+  /// [pastas] = só as subpastas com esses nomes (null = todas, mais a raiz).
+  /// Duas serventias:
   /// - conferir de verdade antes de apagar do celular (fileId + tamanho);
-  /// - reconhecer um backup antigo depois de reinstalar o app.
-  /// Custo: 1 chamada por subpasta por página de 1000. Resultado vale 10 min.
+  /// - reconhecer o que já subiu (reinstalação, kill no fim de um upload).
   /// Devolve null se não conseguiu listar tudo (rede caiu no meio): quem
   /// chama nunca deve decidir apagar com uma listagem pela metade.
-  static Future<List<ArquivoDrive>?> listarNoDrive(GoogleSignIn gsi) async {
-    final em = _cacheListagemEm;
-    if (_cacheListagem != null &&
-        em != null &&
-        DateTime.now().difference(em) < _validadeListagem) {
-      return _cacheListagem;
-    }
+  static Future<List<ArquivoDrive>?> listarNoDrive(GoogleSignIn gsi,
+      {Set<String>? pastas}) async {
     try {
       final (ok, _) = await garantirContexto(gsi);
       if (!ok) return null;
-      final resultado = <ArquivoDrive>[];
+
       // Subpastas de cada pasta principal (pode haver mais de uma "Limpa
       // Memória" criada por builds antigas; todas valem).
-      final pais = <String, String>{}; // id -> nome da subpasta
-      for (final main in _mainIds) {
-        pais[main] = '';
-        String? pageToken;
-        do {
-          final pt = pageToken;
-          final res = await _naApi(
-              gsi,
-              (api) => api.files.list(
-                    q: "mimeType='application/vnd.google-apps.folder' and '$main' in parents and trashed=false",
-                    $fields: 'nextPageToken, files(id,name)',
-                    pageSize: 1000,
-                    pageToken: pt,
-                  ));
-          for (final f in res.files ?? const <drive.File>[]) {
-            if (f.id != null) pais[f.id!] = f.name ?? '';
-          }
-          pageToken = res.nextPageToken;
-        } while (pageToken != null);
+      var subs = _fresco(_cacheSubsEm) ? _cacheSubs : null;
+      if (subs == null) {
+        final lista = <(String, String)>[];
+        for (final main in _mainIds) {
+          String? pageToken;
+          do {
+            final pt = pageToken;
+            final res = await _naApi(
+                gsi,
+                (api) => api.files.list(
+                      q: "mimeType='application/vnd.google-apps.folder' and '$main' in parents and trashed=false",
+                      $fields: 'nextPageToken, files(id,name)',
+                      pageSize: 1000,
+                      pageToken: pt,
+                    ));
+            for (final f in res.files ?? const <drive.File>[]) {
+              if (f.id != null) lista.add((f.id!, f.name ?? ''));
+            }
+            pageToken = res.nextPageToken;
+          } while (pageToken != null);
+        }
+        subs = lista;
+        _cacheSubs = lista;
+        _cacheSubsEm = DateTime.now();
       }
 
-      // Arquivos de cada subpasta (e da raiz, por via das dúvidas).
-      for (final entry in pais.entries) {
+      final pais = <(String, String)>[
+        if (pastas == null)
+          for (final main in _mainIds) (main, ''),
+        for (final s in subs)
+          if (pastas == null || pastas.contains(s.$2)) s,
+      ];
+
+      final resultado = <ArquivoDrive>[];
+      for (final (paiId, paiNome) in pais) {
+        final cache = _cachePasta[paiId];
+        if (cache != null && _fresco(cache.$1)) {
+          resultado.addAll(cache.$2);
+          continue;
+        }
+        final daPasta = <ArquivoDrive>[];
         String? pageToken;
         do {
           final pt = pageToken;
           final res = await _naApi(
               gsi,
               (api) => api.files.list(
-                    q: "'${entry.key}' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false",
+                    q: "'$paiId' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false",
                     $fields: 'nextPageToken, files(id,name,size)',
                     pageSize: 1000,
                     pageToken: pt,
@@ -591,22 +617,49 @@ class BackupService {
               timeout: const Duration(seconds: 60));
           for (final f in res.files ?? const <drive.File>[]) {
             if (f.id == null) continue;
-            resultado.add(ArquivoDrive(
+            daPasta.add(ArquivoDrive(
               f.id!,
               f.name ?? '',
               int.tryParse(f.size ?? '') ?? 0,
-              entry.value,
+              paiNome,
             ));
           }
           pageToken = res.nextPageToken;
         } while (pageToken != null);
+        _cachePasta[paiId] = (DateTime.now(), daPasta);
+        resultado.addAll(daPasta);
       }
-      _cacheListagem = resultado;
-      _cacheListagemEm = DateTime.now();
       return resultado;
     } catch (_) {
       return null; // rede caiu no meio: quem chamou decide o que fazer
     }
+  }
+
+  /// Procura UM arquivo na subpasta dele (mesmo nome e mesmo tamanho).
+  /// Usado antes de re-subir um arquivo que falhou: às vezes o Drive recebeu
+  /// tudo e só a resposta se perdeu. Achou = devolve o fileId e não sobe de
+  /// novo (sem duplicata). Qualquer erro = null (aí sobe normal).
+  static Future<String?> acharNoDrive(GoogleSignIn gsi, ItemBackup item) async {
+    if (item.bytes <= 0) return null;
+    try {
+      final (ok, _) = await garantirContexto(gsi);
+      if (!ok) return null;
+      final sub = await _subpasta(gsi, item.pasta);
+      final res = await _naApi(
+          gsi,
+          (api) => api.files.list(
+                q: "name='${_esc(item.titulo)}' and '$sub' in parents and trashed=false",
+                $fields: 'files(id,size)',
+                pageSize: 10,
+              ),
+          tentativas: 2);
+      for (final f in res.files ?? const <drive.File>[]) {
+        if (f.id != null && int.tryParse(f.size ?? '') == item.bytes) {
+          return f.id;
+        }
+      }
+    } catch (_) {}
+    return null;
   }
 
   /// Apaga um arquivo no Drive (usado quando o MD5 divergiu: tira o corrompido

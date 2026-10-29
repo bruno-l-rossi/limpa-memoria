@@ -207,6 +207,10 @@ class MainActivity : FlutterActivity() {
                 }
             } catch (_: Exception) {}
             if (total > 0) b.setProgress(total, feitos.coerceAtMost(total), false)
+            // O app renova esta notificação a cada ~15s enquanto vive. Se o
+            // processo morrer, ela some em 2 min em vez de mostrar um número
+            // congelado ("subindo") que não anda mais.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) b.setTimeoutAfter(120_000L)
             nm.notify(idNotif, b.build())
         } catch (_: Exception) {}
     }

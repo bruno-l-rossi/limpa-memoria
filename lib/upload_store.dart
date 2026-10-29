@@ -60,6 +60,10 @@ class UploadStore {
   File get _fJob => File('${_dir!.path}/job.json');
   File get _fTamanhos => File('${_dir!.path}/tamanhos.json');
   File get _fSessoes => File('${_dir!.path}/sessoes.jsonl');
+  File get _fEventos => File('${_dir!.path}/eventos.log');
+  File get _fEventosAntigo => File('${_dir!.path}/eventos.1.log');
+  int _tamEventos = -1; // tamanho aproximado do log atual (rotação)
+  static const _maxEventos = 512 * 1024;
 
   /// Chamar no boot, antes de qualquer leitura. Idempotente e seguro de
   /// chamar em paralelo (a segunda chamada espera a primeira).
@@ -336,6 +340,49 @@ class UploadStore {
         await f.writeAsString(linha, mode: FileMode.append, flush: true);
       } catch (_) {}
     });
+  }
+
+  // ---------- Diário de eventos (diagnóstico local) ----------
+
+  /// Uma linha com data/hora no eventos.log. Gira em 512 KB (guarda o
+  /// anterior como eventos.1.log): nunca cresce sem limite.
+  void registrarEvento(String texto) {
+    if (_dir == null) return;
+    final agora = DateTime.now();
+    String d2(int n) => n.toString().padLeft(2, '0');
+    final carimbo =
+        '${d2(agora.day)}/${d2(agora.month)} ${d2(agora.hour)}:${d2(agora.minute)}:${d2(agora.second)}';
+    final linha = '$carimbo  ${texto.replaceAll('\n', ' ')}\n';
+    final f = _fEventos;
+    final antigo = _fEventosAntigo;
+    _filaEscrita = _filaEscrita.then((_) async {
+      try {
+        if (_tamEventos < 0) {
+          _tamEventos = await f.exists() ? await f.length() : 0;
+        }
+        if (_tamEventos > _maxEventos) {
+          if (await antigo.exists()) await antigo.delete();
+          await f.rename(antigo.path);
+          _tamEventos = 0;
+        }
+        await f.writeAsString(linha, mode: FileMode.append, flush: true);
+        _tamEventos += linha.length;
+      } catch (_) {}
+    });
+  }
+
+  /// As últimas [max] linhas do diário (mais recente por último).
+  Future<List<String>> ultimosEventos({int max = 200}) async {
+    if (_dir == null) return const [];
+    await gravarAgora();
+    final linhas = <String>[];
+    try {
+      if (await _fEventosAntigo.exists()) {
+        linhas.addAll(await _fEventosAntigo.readAsLines());
+      }
+      if (await _fEventos.exists()) linhas.addAll(await _fEventos.readAsLines());
+    } catch (_) {}
+    return linhas.length <= max ? linhas : linhas.sublist(linhas.length - max);
   }
 
   // ---------- Flags ----------
