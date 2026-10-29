@@ -2,6 +2,12 @@
 <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
+    <!-- Android 10: apagar sem 1 diálogo por arquivo (com o legacy storage abaixo). -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29"/>
+    <!-- Sem esta permissão o Android entrega a foto com a LOCALIZAÇÃO (GPS do
+         EXIF) apagada quando o app lê o arquivo. O backup subiria sem o local
+         e o original seria apagado depois: perda de dado. -->
+    <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION"/>
     <!-- Notificação de progresso do backup em segundo plano (Android 13+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.INTERNET"/>
@@ -13,8 +19,9 @@
          O pedido abre o diálogo do próprio Android, o usuário decide. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
     <application
-        android:label="limpa_memoria"
+        android:label="Limpa Memória"
         android:name="${applicationName}"
+        android:requestLegacyExternalStorage="true"
         android:icon="@mipmap/ic_launcher">
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"

@@ -1,3 +1,4 @@
+import 'dart:math';
 import 'package:flutter/services.dart';
 
 /// Info de uma mídia vinda direto do MediaStore.
@@ -14,11 +15,32 @@ class Nativo {
 
   /// Tamanho e caminho de todas as mídias numa consulta só ao MediaStore.
   /// Devolve mapa vazio se o canal não responder (aí vale o fallback por arquivo).
+  ///
+  /// Rodada 10: a consulta roda numa thread nativa e volta em 3 arrays
+  /// paralelos (ids, tamanhos, caminhos). Ainda aceita o formato antigo
+  /// (mapa id -> [tamanho, caminho]) por segurança.
   static Future<Map<String, MidiaNativa>> midias() async {
     try {
-      final bruto = await _canal.invokeMethod<Map<Object?, Object?>>('midias');
+      final bruto = await _canal
+          .invokeMethod<Map<Object?, Object?>>('midias')
+          .timeout(const Duration(seconds: 60));
       if (bruto == null) return {};
       final mapa = <String, MidiaNativa>{};
+      final ids = bruto['ids'];
+      final sizes = bruto['sizes'];
+      final paths = bruto['paths'];
+      if (ids is List && sizes is List && paths is List) {
+        final n = min(ids.length, min(sizes.length, paths.length));
+        for (var i = 0; i < n; i++) {
+          final id = ids[i];
+          if (id == null) continue;
+          mapa['$id'] = MidiaNativa(
+            (sizes[i] as num?)?.toInt() ?? 0,
+            (paths[i] as String?) ?? '',
+          );
+        }
+        return mapa;
+      }
       bruto.forEach((k, v) {
         if (k is String && v is List && v.length >= 2) {
           final bytes = (v[0] as num?)?.toInt() ?? 0;
@@ -63,7 +85,10 @@ class Nativo {
   /// null = não conseguiu (aí o app segue sem a checagem, não bloqueia).
   static Future<String?> md5(String path) async {
     try {
-      return await _canal.invokeMethod<String>('md5', {'path': path});
+      return await _canal
+          .invokeMethod<String>('md5', {'path': path}).timeout(
+              const Duration(minutes: 5),
+              onTimeout: () => null);
     } catch (_) {
       return null;
     }

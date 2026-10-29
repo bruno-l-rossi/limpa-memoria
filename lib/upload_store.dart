@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/foundation.dart' show compute;
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// O que sabemos de um arquivo já enviado: o id do arquivo no Drive (pra
@@ -10,21 +11,31 @@ class EnvioInfo {
   const EnvioInfo({this.fileId, this.bytes});
 }
 
+/// Um envio pra gravar em lote: id local, fileId no Drive, tamanho.
+typedef NovoEnvio = ({String id, String? fileId, int? bytes});
+
 /// Persistência no celular do que já subiu e do backup em andamento.
 ///
-/// Rodada 8: saiu do SharedPreferences (que reescreve um XML inteiro de vários
-/// MB a cada gravação e não aguenta 20-30 mil ids) pra arquivos próprios na
-/// pasta de dados do app:
+/// Arquivos próprios na pasta de dados do app (rodada 8):
 ///
 /// - enviados.jsonl: UMA LINHA por arquivo enviado, em append. Gravar um envio
 ///   custa uma linha, não o arquivo inteiro. Sobrevive a kill no meio (a linha
 ///   ou entrou ou não entrou; nunca corrompe o resto).
 /// - job.json: o backup pedido pelo usuário. Escrita atômica (tmp + rename).
-/// - tamanhos.json: cache de tamanhos SÓ dos fallbacks (a fonte principal agora
-///   é o MediaStore via canal nativo, numa consulta só).
+/// - tamanhos.json: cache de tamanhos SÓ dos fallbacks (a fonte principal é o
+///   MediaStore via canal nativo, numa consulta só).
 ///
-/// Flags pequenas (pausado, wifi, migrações) continuam no SharedPreferences,
-/// que é ótimo pra bool.
+/// Rodada 10 (volume grande):
+/// - leitura e escrita pesadas (30 mil linhas, job de MBs) rodam num isolate
+///   separado: a tela não congela no boot nem ao salvar o job;
+/// - o job fica em memória (ler/decodificar MBs a cada Subir/Retomar era
+///   desperdício) e as escritas dele são serializadas (duas gravações ao mesmo
+///   tempo disputavam o mesmo .tmp);
+/// - gravação em LOTE (reconhecer backup antigo, reconciliação do boot e
+///   duplicatas faziam milhares de appends com flush, um por um);
+/// - enviados.jsonl é compactado no boot quando acumula linhas repetidas.
+///
+/// Flags pequenas (pausado, wifi, migrações) continuam no SharedPreferences.
 class UploadStore {
   static const _kPausado = 'backup_pausado';
   static const _kWifi = 'so_wifi';
@@ -38,31 +49,38 @@ class UploadStore {
   Directory? _dir;
   final Map<String, EnvioInfo> _enviados = {};
   Map<String, int>? _tamCache;
-  // Fila de escrita: appends encadeados um após o outro, cada um com flush.
-  // Sem buffer em memória = um kill não perde linha já "gravada".
+  List<Map<String, String>>? _job; // cache em memória do job.json
+  // Fila de escrita dos appends: um após o outro, cada um com flush.
   Future<void> _filaEscrita = Future.value();
-  bool _pronto = false;
+  // Fila das escritas atômicas (job, tamanhos, compactação).
+  Future<void> _filaAtomica = Future.value();
+  Future<void>? _iniciando;
 
   File get _fEnviados => File('${_dir!.path}/enviados.jsonl');
   File get _fJob => File('${_dir!.path}/job.json');
   File get _fTamanhos => File('${_dir!.path}/tamanhos.json');
   File get _fSessoes => File('${_dir!.path}/sessoes.jsonl');
 
-  /// Chamar UMA vez no boot, antes de qualquer leitura. Carrega os enviados
-  /// pra memória e roda a migração do SharedPreferences se for a primeira vez.
-  Future<void> init(String? dirDados) async {
-    if (_pronto) return;
+  /// Chamar no boot, antes de qualquer leitura. Idempotente e seguro de
+  /// chamar em paralelo (a segunda chamada espera a primeira).
+  Future<void> init(String? dirDados) => _iniciando ??= _init(dirDados);
+
+  Future<void> _init(String? dirDados) async {
     if (dirDados == null || dirDados.isEmpty) {
       // Sem canal nativo (não deveria acontecer no Android). Segue só com o
       // legado do SharedPreferences pra não perder o histórico.
       await _carregarLegado();
-      _pronto = true;
       return;
     }
     _dir = Directory(dirDados);
-    await _migrarSePrecisar();
+    try {
+      if (!await _dir!.exists()) await _dir!.create(recursive: true);
+    } catch (_) {}
+    try {
+      await _migrarSePrecisar();
+    } catch (_) {}
     await _carregarEnviados();
-    _pronto = true;
+    await _carregarJob();
   }
 
   Future<void> _migrarSePrecisar() async {
@@ -95,24 +113,32 @@ class UploadStore {
 
   Future<void> _carregarEnviados() async {
     _enviados.clear();
-    if (!await _fEnviados.exists()) return;
+    final f = _fEnviados;
+    if (!await f.exists()) return;
     try {
-      final linhas = await _fEnviados.readAsLines();
-      for (final l in linhas) {
-        if (l.trim().isEmpty) continue;
-        try {
-          final m = jsonDecode(l) as Map;
-          final id = m['id']?.toString();
-          if (id == null || id.isEmpty) continue;
-          _enviados[id] = EnvioInfo(
-            fileId: m['fileId']?.toString(),
-            bytes: (m['bytes'] as num?)?.toInt(),
-          );
-        } catch (_) {
-          // linha meio escrita num kill: ignora, o resto do arquivo vale
-        }
+      // Parse de dezenas de milhares de linhas fora da thread da tela.
+      final (mapa, linhas) = await compute(_parseEnviados, f.path);
+      mapa.forEach((id, v) {
+        _enviados[id] = EnvioInfo(fileId: v[0] as String?, bytes: v[1] as int?);
+      });
+      // Muitas linhas repetidas (atualizações de fileId, regravações)?
+      // Compacta uma vez: boot seguinte lê menos.
+      if (linhas > _enviados.length * 1.3 + 200) {
+        await _compactarEnviados();
       }
     } catch (_) {}
+  }
+
+  Future<void> _carregarJob() async {
+    _job = [];
+    if (_dir == null) return;
+    try {
+      final f = _fJob;
+      if (!await f.exists()) return;
+      _job = await compute(_parseJob, f.path);
+    } catch (_) {
+      _job = [];
+    }
   }
 
   Future<void> _carregarLegado() async {
@@ -122,49 +148,98 @@ class UploadStore {
     }
   }
 
-  Future<void> _gravarAtomico(File f, String conteudo) async {
+  static Future<void> _gravarAtomico(File f, String conteudo) async {
     final tmp = File('${f.path}.tmp');
     await tmp.writeAsString(conteudo, flush: true);
     await tmp.rename(f.path);
   }
 
+  /// Enfileira uma escrita atômica: nunca duas ao mesmo tempo no mesmo .tmp.
+  Future<void> _naFilaAtomica(Future<void> Function() fn) {
+    final f = _filaAtomica.then((_) => fn()).catchError((_) {});
+    _filaAtomica = f;
+    return f;
+  }
+
+  static String _linha(String id, EnvioInfo info) {
+    final m = <String, Object>{'id': id};
+    if (info.fileId != null) m['fileId'] = info.fileId!;
+    if (info.bytes != null) m['bytes'] = info.bytes!;
+    return jsonEncode(m);
+  }
+
+  Future<void> _compactarEnviados() async {
+    if (_dir == null) return;
+    await gravarAgora(); // appends pendentes antes de reescrever
+    final copia = Map<String, EnvioInfo>.of(_enviados);
+    final f = _fEnviados;
+    await _naFilaAtomica(() async {
+      final buf = StringBuffer();
+      copia.forEach((id, info) => buf.writeln(_linha(id, info)));
+      await _gravarAtomico(f, buf.toString());
+    });
+  }
+
   // ---------- Enviados ----------
 
+  /// Cópia dos ids enviados (o main guarda a dele).
   Future<Set<String>> enviados() async => _enviados.keys.toSet();
+
+  int get totalEnviados => _enviados.length;
 
   EnvioInfo? envioDe(String id) => _enviados[id];
 
-  /// Marca como enviado e grava NA HORA (uma linha em append; barato).
-  Future<void> marcarEnviado(String id, {String? fileId, int? bytes}) async {
+  /// Aplica um envio em memória e devolve a linha a gravar (ou null se não
+  /// mudou nada).
+  String? _aplicar(String id, String? fileId, int? bytes) {
     final atual = _enviados[id];
     if (atual != null &&
         (fileId == null || atual.fileId == fileId) &&
         (bytes == null || atual.bytes == bytes)) {
-      return; // nada novo pra gravar
+      return null; // nada novo pra gravar
     }
-    _enviados[id] = EnvioInfo(
+    final info = EnvioInfo(
       fileId: fileId ?? atual?.fileId,
       bytes: bytes ?? atual?.bytes,
     );
-    if (_dir == null) return;
-    final m = <String, Object>{'id': id};
-    final info = _enviados[id]!;
-    if (info.fileId != null) m['fileId'] = info.fileId!;
-    if (info.bytes != null) m['bytes'] = info.bytes!;
-    final linha = '${jsonEncode(m)}\n';
-    // Encadeia na fila: uma escrita por vez, com flush, sem se atropelar.
+    _enviados[id] = info;
+    return _linha(id, info);
+  }
+
+  void _append(String texto) {
+    if (_dir == null || texto.isEmpty) return;
+    final f = _fEnviados;
     _filaEscrita = _filaEscrita.then((_) async {
       try {
-        await _fEnviados.writeAsString(linha,
-            mode: FileMode.append, flush: true);
+        await f.writeAsString(texto, mode: FileMode.append, flush: true);
       } catch (_) {}
     });
   }
 
-  /// Espera a fila de escrita esvaziar. Chamar ao ir pro fundo/fechar.
+  /// Marca como enviado e grava NA HORA (uma linha em append; barato).
+  /// Se já estava marcado e chega um fileId/tamanho novo, atualiza.
+  Future<void> marcarEnviado(String id, {String? fileId, int? bytes}) async {
+    final linha = _aplicar(id, fileId, bytes);
+    if (linha != null) _append('$linha\n');
+  }
+
+  /// Marca vários de uma vez: UM append com todas as linhas.
+  Future<void> marcarEnviadosEmLote(Iterable<NovoEnvio> envios) async {
+    final buf = StringBuffer();
+    for (final e in envios) {
+      final linha = _aplicar(e.id, e.fileId, e.bytes);
+      if (linha != null) buf.writeln(linha);
+    }
+    if (buf.isNotEmpty) _append(buf.toString());
+  }
+
+  /// Espera as filas de escrita esvaziarem. Chamar ao ir pro fundo/fechar.
   Future<void> gravarAgora() async {
     try {
       await _filaEscrita;
+    } catch (_) {}
+    try {
+      await _filaAtomica;
     } catch (_) {}
   }
 
@@ -174,44 +249,54 @@ class UploadStore {
     for (final id in ids) {
       _enviados.remove(id);
     }
-    if (_dir == null) return;
-    await gravarAgora(); // espera os appends pendentes antes de compactar
-    final buf = StringBuffer();
-    _enviados.forEach((id, info) {
-      final m = <String, Object>{'id': id};
-      if (info.fileId != null) m['fileId'] = info.fileId!;
-      if (info.bytes != null) m['bytes'] = info.bytes!;
-      buf.writeln(jsonEncode(m));
-    });
-    await _gravarAtomico(_fEnviados, buf.toString());
+    await _compactarEnviados();
   }
 
   // ---------- Job ----------
 
-  /// O backup que o usuário pediu: lista de {id, titulo, pasta, bytes, path}.
+  /// O backup que o usuário pediu: lista de {id, titulo, pasta, bytes, path, dup}.
   Future<void> salvarJob(List<Map<String, String>> itens) async {
+    _job = List.of(itens);
     if (_dir == null) return;
-    await _gravarAtomico(_fJob, jsonEncode(itens));
+    final f = _fJob;
+    final copia = List<Map<String, String>>.of(itens);
+    await _naFilaAtomica(() async {
+      final txt = await compute(_encodeJob, copia);
+      await _gravarAtomico(f, txt);
+    });
   }
 
-  Future<List<Map<String, String>>> job() async {
-    if (_dir == null || !await _fJob.exists()) return [];
-    try {
-      final raw = await _fJob.readAsString();
-      if (raw.isEmpty) return [];
-      final lista = (jsonDecode(raw) as List).cast<Map>();
-      return lista
-          .map((m) => m.map((k, v) => MapEntry(k.toString(), v.toString())))
-          .toList();
-    } catch (_) {
-      return [];
+  /// Cópia do job atual (em memória; lido do disco uma vez no boot).
+  Future<List<Map<String, String>>> job() async =>
+      List<Map<String, String>>.of(_job ?? const []);
+
+  /// Tira ids do job (apagados do celular, ou que sumiram da galeria). Sem
+  /// isso o job guardava ids que não existem mais, e a retomada tentava
+  /// subir arquivos apagados pra sempre.
+  Future<int> removerDoJob(Set<String> ids) async {
+    final atual = _job;
+    if (atual == null || atual.isEmpty || ids.isEmpty) return 0;
+    final antes = atual.length;
+    final novo = atual.where((m) => !ids.contains(m['id'])).toList();
+    final removidos = antes - novo.length;
+    if (removidos == 0) return 0;
+    if (novo.isEmpty) {
+      await limparJob();
+    } else {
+      await salvarJob(novo);
     }
+    return removidos;
   }
 
   Future<void> limparJob() async {
-    try {
-      if (_dir != null && await _fJob.exists()) await _fJob.delete();
-    } catch (_) {}
+    _job = [];
+    if (_dir == null) return;
+    final f = _fJob;
+    await _naFilaAtomica(() async {
+      try {
+        if (await f.exists()) await f.delete();
+      } catch (_) {}
+    });
   }
 
   // ---------- Cache de tamanhos (só fallbacks) ----------
@@ -233,21 +318,22 @@ class UploadStore {
     final cache = await tamanhos();
     cache.addAll(novos);
     if (_dir == null) return;
-    await _gravarAtomico(_fTamanhos, jsonEncode(cache));
+    final f = _fTamanhos;
+    final txt = jsonEncode(cache);
+    await _naFilaAtomica(() => _gravarAtomico(f, txt));
   }
 
   // ---------- Telemetria local (diagnóstico, nada sai do celular) ----------
 
   /// Grava o resumo de uma sessão de backup (uma linha em append): início,
-  /// fim, quantos arquivos, GB, falhas e o último erro. Sem isso, cada
-  /// travamento em job de horas vira sessão de detetive por print.
+  /// fim, quantos arquivos, GB, falhas e o último erro.
   Future<void> registrarSessao(Map<String, Object?> resumo) async {
     if (_dir == null) return;
     final linha = '${jsonEncode(resumo)}\n';
+    final f = _fSessoes;
     _filaEscrita = _filaEscrita.then((_) async {
       try {
-        await _fSessoes.writeAsString(linha,
-            mode: FileMode.append, flush: true);
+        await f.writeAsString(linha, mode: FileMode.append, flush: true);
       } catch (_) {}
     });
   }
@@ -300,3 +386,39 @@ class UploadStore {
     await p.setBool(_kMigrouJanela, true);
   }
 }
+
+// ---------- Funções de isolate (top-level: só o argumento atravessa) ----------
+
+(Map<String, List<Object?>>, int) _parseEnviados(String caminho) {
+  final m = <String, List<Object?>>{};
+  var n = 0;
+  for (final l in File(caminho).readAsLinesSync()) {
+    if (l.trim().isEmpty) continue;
+    n++;
+    try {
+      final j = jsonDecode(l) as Map;
+      final id = j['id']?.toString();
+      if (id == null || id.isEmpty) continue;
+      final ant = m[id];
+      // Linha mais nova vence, mas não apaga fileId/bytes já sabidos.
+      m[id] = [
+        j['fileId']?.toString() ?? ant?[0],
+        (j['bytes'] as num?)?.toInt() ?? ant?[1],
+      ];
+    } catch (_) {
+      // linha meio escrita num kill: ignora, o resto do arquivo vale
+    }
+  }
+  return (m, n);
+}
+
+List<Map<String, String>> _parseJob(String caminho) {
+  final raw = File(caminho).readAsStringSync();
+  if (raw.isEmpty) return <Map<String, String>>[];
+  final lista = (jsonDecode(raw) as List).cast<Map>();
+  return lista
+      .map((m) => m.map((k, v) => MapEntry(k.toString(), v.toString())))
+      .toList();
+}
+
+String _encodeJob(List<Map<String, String>> itens) => jsonEncode(itens);

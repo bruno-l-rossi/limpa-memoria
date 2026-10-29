@@ -3,6 +3,7 @@ package com.rideblan.limpa_memoria
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -18,15 +19,20 @@ import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.io.FileInputStream
 import java.security.MessageDigest
+import java.util.concurrent.Executors
 
 /// Canal nativo do app. Serviços que o Flutter não alcança direito, sem
 /// depender de plugin novo:
 ///
 /// - "midias": tamanho (SIZE) e caminho real (DATA) de TODAS as mídias numa
 ///   consulta só ao MediaStore (substitui abrir arquivo por arquivo).
+///   Rodada 10: roda FORA da thread principal (com 30 mil mídias a consulta
+///   levava segundos e travava a tela, risco de ANR) e devolve arrays
+///   tipados, que atravessam o canal muito mais rápido que um mapa.
 /// - "bateriaIsenta"/"pedirIsencaoBateria": isenção do Doze pra job de horas.
 /// - "dirDados": pasta de dados do app pro armazenamento em arquivo.
-/// - "md5": hash MD5 de um arquivo, em thread própria (integridade do upload).
+/// - "md5": hash MD5 de um arquivo, num pool de 2 threads (integridade do
+///   upload sem abrir uma thread nova por arquivo).
 /// - "compartilhar": share sheet do Android com um texto.
 /// - "notificar"/"limparNotificacao": notificação de progresso com o número
 ///   REAL da sessão ("4.312 de 19.000"), que o background_downloader não sabe.
@@ -34,13 +40,26 @@ class MainActivity : FlutterActivity() {
     private val canal = "limpa_memoria/nativo"
     private val canalNotif = "backup_progresso"
     private val idNotif = 4242
+    private val main = Handler(Looper.getMainLooper())
+
+    companion object {
+        // Consulta ao MediaStore: 1 thread basta (é uma consulta por vez).
+        private val ioPool = Executors.newSingleThreadExecutor()
+        // MD5: 2 threads. Mais que isso disputa disco com o próprio upload.
+        private val md5Pool = Executors.newFixedThreadPool(2)
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, canal)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
-                    "midias" -> result.success(consultarMidias())
+                    "midias" -> {
+                        ioPool.execute {
+                            val r = consultarMidias()
+                            main.post { result.success(r) }
+                        }
+                    }
                     "dirDados" -> result.success(applicationContext.filesDir.absolutePath)
                     "bateriaIsenta" -> result.success(bateriaIsenta())
                     "pedirIsencaoBateria" -> {
@@ -70,10 +89,13 @@ class MainActivity : FlutterActivity() {
             }
     }
 
-    /// Mapa id -> [tamanho em bytes, caminho real]. Uma consulta só, indexada.
-    /// O id do MediaStore é o mesmo que o photo_manager usa como AssetEntity.id.
-    private fun consultarMidias(): HashMap<String, ArrayList<Any>> {
-        val mapa = HashMap<String, ArrayList<Any>>()
+    /// {"ids": LongArray, "sizes": LongArray, "paths": List<String>}, mesma
+    /// ordem nos 3. Uma consulta só, indexada. O id do MediaStore é o mesmo que
+    /// o photo_manager usa como AssetEntity.id.
+    private fun consultarMidias(): HashMap<String, Any> {
+        val ids = ArrayList<Long>()
+        val sizes = ArrayList<Long>()
+        val paths = ArrayList<String>()
         val projecao = arrayOf(
             MediaStore.Files.FileColumns._ID,
             MediaStore.Files.FileColumns.SIZE,
@@ -92,43 +114,54 @@ class MainActivity : FlutterActivity() {
                 val iId = c.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID)
                 val iSize = c.getColumnIndexOrThrow(MediaStore.Files.FileColumns.SIZE)
                 val iData = c.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DATA)
+                ids.ensureCapacity(c.count)
+                sizes.ensureCapacity(c.count)
+                paths.ensureCapacity(c.count)
                 while (c.moveToNext()) {
-                    val id = c.getLong(iId).toString()
-                    val tamanho = c.getLong(iSize)
-                    val caminho = c.getString(iData) ?: ""
-                    mapa[id] = arrayListOf(tamanho, caminho)
+                    ids.add(c.getLong(iId))
+                    sizes.add(if (c.isNull(iSize)) 0L else c.getLong(iSize))
+                    paths.add(c.getString(iData) ?: "")
                 }
             }
         } catch (_: Exception) {
             // Devolve o que conseguiu; o Dart tem fallback por arquivo.
         }
-        return mapa
+        return hashMapOf(
+            "ids" to ids.toLongArray(),
+            "sizes" to sizes.toLongArray(),
+            "paths" to paths,
+        )
     }
 
-    /// MD5 de um arquivo em thread própria (não trava a UI nem o canal).
+    /// MD5 de um arquivo fora da thread principal.
     /// Devolve o hash em hex minúsculo, ou null se não deu.
     private fun md5Async(path: String?, result: MethodChannel.Result) {
         if (path.isNullOrEmpty()) {
             result.success(null)
             return
         }
-        val main = Handler(Looper.getMainLooper())
-        Thread {
+        md5Pool.execute {
             var hex: String? = null
             try {
                 val md = MessageDigest.getInstance("MD5")
                 FileInputStream(File(path)).use { fis ->
-                    val buf = ByteArray(1 shl 16)
+                    val buf = ByteArray(1 shl 17)
                     while (true) {
                         val n = fis.read(buf)
                         if (n <= 0) break
                         md.update(buf, 0, n)
                     }
                 }
-                hex = md.digest().joinToString("") { "%02x".format(it) }
+                val sb = StringBuilder(32)
+                for (b in md.digest()) {
+                    val v = b.toInt() and 0xff
+                    if (v < 16) sb.append('0')
+                    sb.append(Integer.toHexString(v))
+                }
+                hex = sb.toString()
             } catch (_: Exception) {}
             main.post { result.success(hex) }
-        }.start()
+        }
     }
 
     private fun compartilhar(texto: String) {
@@ -143,6 +176,7 @@ class MainActivity : FlutterActivity() {
 
     /// Notificação com o número real da sessão e barra de progresso. Convive
     /// com a notificação do foreground service (que é estática de propósito).
+    /// Tocar nela abre o app (antes não fazia nada).
     private fun notificar(titulo: String, texto: String, feitos: Int, total: Int) {
         try {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -163,6 +197,15 @@ class MainActivity : FlutterActivity() {
                 .setSmallIcon(applicationInfo.icon)
                 .setOnlyAlertOnce(true)
                 .setOngoing(true)
+            try {
+                val abrir = packageManager.getLaunchIntentForPackage(packageName)
+                if (abrir != null) {
+                    abrir.flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    val flags = PendingIntent.FLAG_UPDATE_CURRENT or
+                        (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
+                    b.setContentIntent(PendingIntent.getActivity(this, 0, abrir, flags))
+                }
+            } catch (_: Exception) {}
             if (total > 0) b.setProgress(total, feitos.coerceAtMost(total), false)
             nm.notify(idNotif, b.build())
         } catch (_: Exception) {}
@@ -176,8 +219,12 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun bateriaIsenta(): Boolean {
-        val pm = getSystemService(POWER_SERVICE) as PowerManager
-        return pm.isIgnoringBatteryOptimizations(packageName)
+        return try {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            pm.isIgnoringBatteryOptimizations(packageName)
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun pedirIsencaoBateria() {
