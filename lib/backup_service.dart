@@ -319,7 +319,7 @@ class BackupService {
   /// pro background_downloader. Devolve (ok, erro). Renova o token se expirou.
   static Future<(bool, String?)> enfileirarUm(
       GoogleSignIn gsi, ItemBackup item,
-      {bool soWifi = false}) async {
+      {bool soWifi = false, bool transferenciaLonga = false}) async {
     try {
       final (ok, err) = await garantirContexto(gsi);
       if (!ok) return (false, err);
@@ -366,6 +366,11 @@ class BackupService {
         // de rede/DNS sem desistir do arquivo.
         retries: 10,
         requiresWiFi: soWifi,
+        // Prioridade 0 + notificação + Android 14+ = UIDT (job iniciado pelo
+        // usuário, sem o teto de 6 h por dia do serviço dataSync). Se o
+        // Android recusar (ex.: app fora da tela), a biblioteca cai sozinha
+        // pro WorkManager, que é o comportamento de antes.
+        priority: transferenciaLonga ? 0 : 5,
         metaData: MetaTarefa(item.pasta, ehCache, item.bytes,
                 titulo: item.titulo)
             .codificar(),
@@ -378,6 +383,33 @@ class BackupService {
     } catch (e) {
       if (_ehTransitorio(e)) return (false, '$prefixoRede$e');
       return (false, '$e');
+    }
+  }
+
+  /// Abre só a sessão retomável de um item (motor novo: quem manda os bytes
+  /// é o UploadRetomavel, em partes). Devolve (url, erro).
+  static Future<(String?, String?)> criarSessaoPara(
+      GoogleSignIn gsi, ItemBackup item) async {
+    try {
+      final (ok, err) = await garantirContexto(gsi);
+      if (!ok) return (null, err);
+      final subId = await _subpasta(gsi, item.pasta);
+      var (sessao, erro) =
+          await _criarSessao(_token!, item.titulo, subId, data: item.data);
+      if (sessao == null && erro == 'token-expirado') {
+        final novo = await _renovarToken(gsi);
+        if (novo != null) {
+          (sessao, erro) =
+              await _criarSessao(novo, item.titulo, subId, data: item.data);
+        }
+        if (sessao == null && erro == 'token-expirado') {
+          erro = '${prefixoRede}login do Google expirou, renovando';
+        }
+      }
+      return (sessao, erro);
+    } catch (e) {
+      if (_ehTransitorio(e)) return (null, '$prefixoRede$e');
+      return (null, '$e');
     }
   }
 

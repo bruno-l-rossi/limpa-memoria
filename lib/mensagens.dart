@@ -19,7 +19,7 @@ String mensagemAmigavel(Object? erro) {
       b.contains('timed out') ||
       b.contains('timeout') ||
       b.contains('sem conexão') ||
-      b.contains('rede')) {
+      RegExp(r'\brede\b').hasMatch(b)) {
     return 'Sem conexão com a internet agora. Confira o wifi ou os dados e tente de novo.';
   }
   if (b.contains('sign_in_canceled') || b.contains('canceled')) {

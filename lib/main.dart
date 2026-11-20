@@ -17,6 +17,7 @@ import 'verificacao_apagar.dart';
 import 'telemetria.dart';
 import 'mensagens.dart';
 import 'sugestoes.dart';
+import 'upload_retomavel.dart';
 
 void main() => runApp(const MyApp());
 
@@ -223,16 +224,27 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _driveCheio = false; // pausa automática por cota estourada
   bool _soWifi = false; // subir só no wifi (escolha do usuário)
   bool _motorNovo = false; // F4: motor nativo retomável (experimental)
+  bool _transferenciaLonga = false; // F3: UIDT no Android 14+ (experimental)
   StreamSubscription<TaskUpdate>? _sub;
 
   // Janela deslizante guiada pelo banco da biblioteca (a fonte da verdade).
-  static const int _janela = 40;
+  // Janela por arquivos E por bytes (rodada 14): 40 fotos de 2 MB eram um
+  // colchão de 80 MB; 40 vídeos, dezenas de GB presos na fila do Android.
+  static const int _janelaMax = 80;
+  static const int _janelaMin = 8;
+  static const int _janelaBytes = 4 * 1024 * 1024 * 1024;
   static const int _concorrenciaPreparo = 6;
   final ListQueue<ItemBackup> _pendentes = ListQueue(); // não enfileirados
   final Set<String> _naFila = {}; // ids em _pendentes (sem repetição)
   final Set<String> _emAndamento = {}; // ativos no motor agora
   final Set<String> _preparando = {}; // saíram da fila, ainda abrindo sessão
   final Set<String> _processando = {}; // conclusão sendo conferida (MD5)
+  // Motor novo (rodada 15, experimental): arquivos grandes sobem em partes
+  // pelo próprio app, com retomada de onde parou.
+  UploadRetomavel? _retomavel;
+  final Set<String> _emRetomavel = {};
+  static const int _minRetomavel = 64 * 1024 * 1024;
+  static const int _maxRetomavelJuntos = 2;
   final Map<String, int> _tentativas = {}; // re-tentativas por id
   final Map<String, int> _tentativasRede = {}; // quedas de rede por id
   final Set<String> _corrompidos = {}; // chegaram diferentes: nunca "achar"
@@ -416,6 +428,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _emAndamento.isNotEmpty ||
       _preparando.isNotEmpty ||
       _processando.isNotEmpty ||
+      _emRetomavel.isNotEmpty ||
       _alimentando;
 
   /// A sessão parou de andar com arquivos que não subiram (falharam de vez).
@@ -614,6 +627,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           _naFila.contains(id) ||
           _preparando.contains(id) ||
           _processando.contains(id) ||
+          _emRetomavel.contains(id) ||
           _falhos.containsKey(id);
       if (ok) {
         _ausentesDesde.remove(id);
@@ -857,19 +871,45 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         _emAndamento.addAll(ativos.where((id) => !_enviadosIds.contains(id)));
       } catch (_) {}
 
-      final vagas = _janela - _emAndamento.length - _preparando.length;
-      while (lote.length < vagas && _pendentes.isNotEmpty) {
+      var emVoo = _emAndamento.length + _preparando.length;
+      var bytesEmVoo = 0;
+      for (final id in _emAndamento) {
+        bytesEmVoo += _bytesPorId[id] ?? 0;
+      }
+      for (final id in _preparando) {
+        bytesEmVoo += _bytesPorId[id] ?? 0;
+      }
+      while (emVoo < _janelaMax && _pendentes.isNotEmpty) {
+        final prox = _pendentes.first;
+        if (emVoo >= _janelaMin && bytesEmVoo + prox.bytes > _janelaBytes) {
+          break;
+        }
         final item = _tirarDaFila()!;
         if (item.dup.isNotEmpty ||
             _enviadosIds.contains(item.id) ||
             _emAndamento.contains(item.id) ||
             _preparando.contains(item.id) ||
             _processando.contains(item.id) ||
+            _emRetomavel.contains(item.id) ||
             !_emFila.contains(item.id)) {
+          continue;
+        }
+        // Motor novo: arquivo grande sobe em partes, com retomada.
+        if (_motorNovo &&
+            _retomavel != null &&
+            item.bytes >= _minRetomavel &&
+            item.path.isNotEmpty &&
+            _emRetomavel.length < _maxRetomavelJuntos) {
+          _emRetomavel.add(item.id);
+          emVoo++;
+          bytesEmVoo += item.bytes;
+          unawaited(_enviarRetomavel(item));
           continue;
         }
         lote.add(item);
         _preparando.add(item.id);
+        emVoo++;
+        bytesEmVoo += item.bytes;
       }
       if (lote.isEmpty) return;
 
@@ -905,8 +945,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             }
           }
           final t0 = DateTime.now();
-          final (ok, erro) =
-              await BackupService.enfileirarUm(_gsi, item, soWifi: _soWifi);
+          final (ok, erro) = await BackupService.enfileirarUm(_gsi, item,
+              soWifi: _soWifi, transferenciaLonga: _transferenciaLonga);
           _telemetria.preparo(DateTime.now().difference(t0));
           return (item: item, ok: ok, erro: erro);
         }));
@@ -1001,6 +1041,83 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (_alimentarDeNovo) {
       _alimentarDeNovo = false;
       unawaited(_alimentar());
+    }
+  }
+
+  /// Motor novo: sobe UM arquivo grande em partes. Rede caiu, app fechou,
+  /// Parar: a sessão fica salva e a próxima tentativa continua de onde parou.
+  Future<void> _enviarRetomavel(ItemBackup item) async {
+    final id = item.id;
+    _agendarRefresh();
+    try {
+      final t0 = DateTime.now();
+      final r = await _retomavel!.enviar(
+        id,
+        item.path,
+        criarSessao: () => BackupService.criarSessaoPara(_gsi, item),
+        cancelado: () => _pausado || _conta == null,
+      );
+      _telemetria.preparo(DateTime.now().difference(t0));
+      switch (r.fim) {
+        case FimUpload.ok:
+          String? motivo;
+          var verificou = false;
+          if (r.bytes != null && item.bytes > 0 && r.bytes != item.bytes) {
+            motivo = 'tamanho';
+          } else if (r.md5 != null && item.bytes <= _tetoMd5) {
+            final ml = await Nativo.md5(item.path);
+            if (ml != null && ml != r.md5) motivo = 'md5';
+            if (ml != null && ml == r.md5) verificou = true;
+          }
+          if (motivo != null) {
+            final fid = r.fileId;
+            if (fid != null) unawaited(BackupService.apagarNoDrive(_gsi, fid));
+            _corrompidos.add(id);
+            final t = (_tentativas[id] ?? 0) + 1;
+            _tentativas[id] = t;
+            _ev('Motor novo: chegou diferente ($motivo), tentativa $t: "${item.titulo}"');
+            if (t <= 3) {
+              _porNaFila(item, frente: true);
+            } else {
+              _falhos[id] = item;
+              _motivoFalha[id] = 'Chegou diferente no Drive 3 vezes';
+              _telemetria.falhasDefinitivas++;
+            }
+          } else {
+            _ev('Motor novo: subiu em partes "${item.titulo}" (${_fmt(item.bytes)})');
+            await _confirmarEnvio(id, r.fileId, r.bytes ?? item.bytes,
+                verificado: verificou);
+          }
+        case FimUpload.cancelado:
+          // Parar: a fila é refeita pelo Retomar; o que já foi fica salvo.
+          _ev('Motor novo: pausado no meio de "${item.titulo}", continua depois');
+        case FimUpload.rede:
+        case FimUpload.sessaoInvalida:
+          _telemetria.retentativasRede++;
+          _porNaFila(item, frente: true);
+          if (r.fim == FimUpload.rede) _esperarRede();
+        case FimUpload.erro:
+          final t = (_tentativas[id] ?? 0) + 1;
+          _tentativas[id] = t;
+          _ev('Motor novo: erro em "${item.titulo}": ${r.erro}');
+          if (t <= 3) {
+            _porNaFila(item);
+          } else {
+            _falhos[id] = item;
+            _motivoFalha[id] = mensagemAmigavel(r.erro);
+            _telemetria.falhasDefinitivas++;
+            _erroBg = r.erro;
+          }
+      }
+    } catch (e) {
+      _ev('Motor novo: exceção em "${item.titulo}": $e');
+      _porNaFila(item, frente: true);
+    } finally {
+      _emRetomavel.remove(id);
+      _mudou();
+      _agendarRefresh();
+      _verificarFim();
+      unawaited(_tick());
     }
   }
 
@@ -1140,7 +1257,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       'Galeria: ${_milhar(_items.length)} itens · acesso ${_acessoTotal ? 'total' : (_acessoParcial ? 'PARCIAL' : 'negado')}',
       'Enviados no store: ${_milhar(_enviadosIds.length)}',
       'Sessão: ${_milhar(_cFeitos)} de ${_milhar(_bgTotal)} · ${_fmt(_cBytesFeitos)} de ${_fmt(_cBytesTotal)}',
-      'Fila: ${_milhar(_pendentes.length)} · no Android: ${_emAndamento.length} · preparando: ${_preparando.length} · conferindo: ${_processando.length}',
+      'Fila: ${_milhar(_pendentes.length)} · no Android: ${_emAndamento.length} · preparando: ${_preparando.length} · conferindo: ${_processando.length} · em partes: ${_emRetomavel.length}',
+      'Motor novo: ${_motorNovo ? 'ligado' : 'desligado'} · transferência longa: ${_transferenciaLonga ? 'ligada' : 'desligada'}',
       'Falhos: ${_falhos.length} · pausado: ${_pausado ? 'sim' : 'não'}${_driveCheio ? ' (Drive cheio)' : ''} · sem rede: ${_semRede ? 'sim' : 'não'}',
       'Nesta execução: ${_milhar(_arquivosSessao)} arquivos, ${_fmt(_bytesSessao)} · ${_fmt(_velocidade.round())}/s',
       'Bateria isenta: ${isenta ? 'sim' : 'NÃO'} · só wifi: ${_soWifi ? 'sim' : 'não'}',
@@ -1732,9 +1850,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         .where((it) => it.dup.isEmpty)
         .fold<int>(0, (s, it) => s + it.bytes));
 
-    // Maiores primeiro: libera mais espaço mais cedo.
-    final fila = pendentesItens.where((it) => it.dup.isEmpty).toList()
-      ..sort((a, b) => b.bytes.compareTo(a.bytes));
+    // Grandes em ordem decrescente (liberam espaço mais cedo), intercalados
+    // com levas de fotos pequenas: rede e custo por arquivo ocupados juntos.
+    final fila = ordenarFila(pendentesItens.where((it) => it.dup.isEmpty));
 
     await _store.salvarJob(mergedItens.map((e) => e.toMap()).toList());
     await _store.setPausado(false);
@@ -2143,7 +2261,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// Decide entre onboarding e o app. O motor e a galeria só sobem depois que
   /// o onboarding foi visto (é ele que explica as permissões que vêm a seguir).
   Future<void> _boot() async {
-    await _store.init(await Nativo.dirDados());
+    final dir = await Nativo.dirDados();
+    await _store.init(dir);
+    if (dir != null && dir.isNotEmpty) _retomavel = UploadRetomavel(dir);
     _enviadosIds = await _store.enviados();
     _mudou();
     final viu = await _store.viuOnboarding();
@@ -2232,11 +2352,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final pausado = await _store.pausado();
     final soWifi = await _store.soWifi();
     final motorNovo = await _store.flag(UploadStore.kMotorNovo);
+    final transfLonga = await _store.flag(UploadStore.kTransferenciaLonga);
     if (!mounted) return;
     setState(() {
       _pausado = pausado;
       _soWifi = soWifi;
       _motorNovo = motorNovo;
+      _transferenciaLonga = transfLonga;
       if (job.isNotEmpty) {
         _carregarSessao(job.map(ItemBackup.fromMap).toList());
         _inicioSessao ??= DateTime.now();
@@ -2309,13 +2431,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ..addAll(ativos.where((id) => !_enviadosIds.contains(id)));
     } catch (_) {}
 
-    final pendentes = [
+    final pendentes = ordenarFila([
       for (final id in _emFila)
         if (!_enviadosIds.contains(id) &&
             !_emAndamento.contains(id) &&
             (_itemDoJob[id]?.dup.isEmpty ?? false))
           _itemDoJob[id]!
-    ]..sort((a, b) => b.bytes.compareTo(a.bytes)); // maiores primeiro
+    ]);
     if (!mounted) return;
     _ev('Retomada: ${pendentes.length} na fila, ${_emAndamento.length} já no motor, total ${_emFila.length}');
     setState(() {
@@ -2896,6 +3018,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           onDiagnostico: _abrirDiagnostico,
           onHistorico: _abrirHistorico,
           motorNovo: _motorNovo,
+          transferenciaLonga: _transferenciaLonga,
+          onTransferenciaLonga: (v) async {
+            await _store.setFlag(UploadStore.kTransferenciaLonga, v);
+            if (mounted) setState(() => _transferenciaLonga = v);
+          },
           onMotorNovo: (v) async {
             await _store.setFlag(UploadStore.kMotorNovo, v);
             if (mounted) setState(() => _motorNovo = v);
@@ -3785,6 +3912,8 @@ class AjustesPage extends StatefulWidget {
   final VoidCallback onHistorico;
   final bool motorNovo;
   final Future<void> Function(bool) onMotorNovo;
+  final bool transferenciaLonga;
+  final Future<void> Function(bool) onTransferenciaLonga;
   const AjustesPage({
     super.key,
     required this.soWifi,
@@ -3795,6 +3924,8 @@ class AjustesPage extends StatefulWidget {
     required this.onHistorico,
     required this.motorNovo,
     required this.onMotorNovo,
+    required this.transferenciaLonga,
+    required this.onTransferenciaLonga,
   });
 
   @override
@@ -3804,6 +3935,7 @@ class AjustesPage extends StatefulWidget {
 class _AjustesPageState extends State<AjustesPage> {
   late bool _soWifi = widget.soWifi;
   late bool _motorNovo = widget.motorNovo;
+  late bool _transfLonga = widget.transferenciaLonga;
   bool? _bateria;
 
   @override
@@ -3876,6 +4008,21 @@ class _AjustesPageState extends State<AjustesPage> {
             onTap: widget.onDiagnostico,
           ),
           const Divider(),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 8, 16, 0),
+            child: Text('Em teste',
+                style: TextStyle(color: _inkMuted, fontSize: 12)),
+          ),
+          SwitchListTile(
+            value: _transfLonga,
+            title: const Text('Transferência longa (Android 14+)'),
+            subtitle: const Text(
+                'Usa o modo do Android feito pra envios grandes. Pode ajudar backups de madrugada a não pararem.'),
+            onChanged: (v) async {
+              setState(() => _transfLonga = v);
+              await widget.onTransferenciaLonga(v);
+            },
+          ),
           SwitchListTile(
             value: _motorNovo,
             title: const Text('Motor novo (experimental)'),

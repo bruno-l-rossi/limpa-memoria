@@ -447,6 +447,7 @@ class UploadStore {
   // Flags genéricas (rodada 13+).
   static const kMotorNovo = 'motor_nativo_v1'; // F4: desligado por padrão
   static const kDicaPrevia = 'dica_previa_v1';
+  static const kTransferenciaLonga = 'uidt_v1'; // F3: UIDT, desligado por padrão
   static const kTotalLiberado = 'total_liberado_bytes';
 
   Future<bool> flag(String chave) async {

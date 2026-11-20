@@ -40,7 +40,9 @@ dependencies:
   googleapis: ^16.0.0
   extension_google_sign_in_as_googleapis_auth: ^2.0.13
   # Backup em segundo plano + retomada de progresso
-  background_downloader: ^9.5.5
+  # 9.6.4+: o modo UIDT (Android 14+) marca o job como iniciado pelo usuário
+  # de verdade (setUserInitiated). Na 9.5.5 virava job comum de 10 min.
+  background_downloader: ^9.6.4
   shared_preferences: ^2.3.2
   http: ^1.2.2
 
