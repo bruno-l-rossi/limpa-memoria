@@ -352,7 +352,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             title: Text(titulo),
             content: ValueListenableBuilder<double>(
               valueListenable: progresso,
-              builder: (_, v, __) => Column(
+              builder: (_, v, _) => Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   LinearProgressIndicator(value: v),
@@ -3084,7 +3084,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
                 crossAxisCount: 3, mainAxisSpacing: 4, crossAxisSpacing: 4),
             itemCount: 18,
-            itemBuilder: (_, __) => Container(color: _parchment),
+            itemBuilder: (_, _) => Container(color: _parchment),
           ),
         ),
       ],
@@ -4066,7 +4066,7 @@ class HistoricoPage extends StatelessWidget {
                   style: TextStyle(color: _inkMuted)))
           : ListView.separated(
               itemCount: sessoes.length,
-              separatorBuilder: (_, __) => const Divider(height: 1),
+              separatorBuilder: (_, _) => const Divider(height: 1),
               itemBuilder: (_, i) {
                 final s = sessoes[i];
                 final arquivos = (s['arquivos'] as num?)?.toInt() ?? 0;

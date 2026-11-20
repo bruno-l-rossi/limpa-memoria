@@ -154,7 +154,7 @@ class UploadRetomavel {
     // Retomando: pergunta ao Drive quanto chegou de fato.
     if (s != null) {
       final r = await _consultar(s);
-      if (r != null) return _fimOk(id, r);
+      if (r != null) return await _fimOk(id, r);
       if (s.enviado < 0) {
         sessoes.remove(id);
         s = null; // sessão inválida
@@ -202,8 +202,8 @@ class UploadRetomavel {
           }
           await Future.delayed(esperaBase * (1 << falhasSeguidas));
           final r = await _consultar(s);
-          if (r != null) return _fimOk(id, r);
-          if (s.enviado < 0) return _invalida(id);
+          if (r != null) return await _fimOk(id, r);
+          if (s.enviado < 0) return await _invalida(id);
           continue;
         }
         final code = resp.statusCode;
@@ -215,9 +215,9 @@ class UploadRetomavel {
           continue;
         }
         if (code == 200 || code == 201) {
-          return _fimOk(id, resp.body);
+          return await _fimOk(id, resp.body);
         }
-        if (code == 404 || code == 410) return _invalida(id);
+        if (code == 404 || code == 410) return await _invalida(id);
         if (code == 429 || code >= 500) {
           falhasSeguidas++;
           if (falhasSeguidas > 4) {
@@ -227,8 +227,8 @@ class UploadRetomavel {
           }
           await Future.delayed(esperaBase * (1 << falhasSeguidas));
           final r = await _consultar(s);
-          if (r != null) return _fimOk(id, r);
-          if (s.enviado < 0) return _invalida(id);
+          if (r != null) return await _fimOk(id, r);
+          if (s.enviado < 0) return await _invalida(id);
           continue;
         }
         // Outro 4xx: sessão não serve mais.
@@ -238,7 +238,7 @@ class UploadRetomavel {
       }
       // Mandou tudo mas não veio a resposta final: consulta.
       final r = await _consultar(s);
-      if (r != null) return _fimOk(id, r);
+      if (r != null) return await _fimOk(id, r);
       await _salvar();
       return const ResultadoRetomavel(FimUpload.rede,
           erro: 'rede: terminou sem resposta do Drive');

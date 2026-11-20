@@ -3,12 +3,32 @@
 ## ESTADO DA EXECUÇÃO (atualizado 2026-11-20) — LEIA PRIMEIRO
 
 Branch `rodadas-12-a-17` (a partir de `main` 85efe74). Versão 1.5.0+6.
-**NADA FOI COMPILADO NEM TESTADO.** A sessão que escreveu o código não tinha
-Flutter/pub.dev liberados. Primeira tarefa da próxima sessão:
-`flutter pub get && flutter analyze && flutter test`, corrigir o que quebrar,
-`flutter build apk --debug` (confere o Kotlin), e só então entregar pro Bruno
-testar no celular. Exige Flutter >= 3.47 (background_downloader 9.6.4 pede
-Dart ^3.13); avisar o Bruno pra rodar `flutter upgrade` no Mac.
+**COMPILADO E TESTADO NA NUVEM em 2026-11-20 (Flutter 3.50.1, Dart 3.14.0).**
+`flutter pub get`, `flutter analyze`, `flutter test` (44 testes) e
+`flutter build apk --debug` passaram. Ainda NÃO foi testado em aparelho:
+próximo passo é o Bruno instalar o APK e seguir a ordem de testes lá embaixo.
+
+Correções feitas na compilação:
+- `android/`: Gradle 9.1.0 → 9.5.0, AGP 9.0.1 → 9.3.1, Kotlin 2.3.20 → 2.4.20.
+  O Flutter 3.50 recusa Gradle < 9.3.1, AGP < 9.1.1 e KGP < 2.4.10.
+- `upload_retomavel.dart`: `return await` nos retornos de `_fimOk`/`_invalida`
+  dentro do try. Sem o await, o `finally` fechava o arquivo antes do fim e um
+  erro escapava do `catch`.
+- `main.dart`: `__` → `_` em 3 builders (lint novo).
+- `pubspec.lock` regenerado (sai google_fonts, entra background_downloader 9.6.4).
+
+Avisos que ficaram (não quebram nada hoje):
+- `package:flutter/material.dart` está deprecado desde o Flutter 3.47 em favor
+  do pacote `material_ui`. CI roda com `--no-fatal-infos`. Migrar numa rodada
+  própria.
+- `photo_manager` ainda aplica o Kotlin Gradle Plugin; versões futuras do
+  Flutter vão recusar. Ver se sai versão com Built-in Kotlin.
+
+No Mac do Bruno: `flutter upgrade` (precisa de Flutter >= 3.50 por causa dos
+mínimos de Gradle/AGP acima). Na nuvem o build só rodou com espelho do Maven
+Central (storage.googleapis.com/maven-central) e o `kotlin-dsl` trocado no SDK
+local, porque Maven Central e plugins-artifacts.gradle.org estão bloqueados lá.
+Isso não mexe no repo.
 
 Feito (por achado da seção 3):
 - F0: lógica pura extraída pra `lib/formatos.dart`, `selecao_backup.dart`,
@@ -63,7 +83,6 @@ Pontos de atenção pra quem compilar:
 - `main.dart` levou muitas edições por script; procurar parênteses/vírgulas
   na `_CelulaMidia` (ganhou `Semantics` por fora), no `build()` (ternário
   novo no `body`) e na aba Pastas (CheckboxListTile virou ListTile).
-- `pubspec.lock` ainda cita google_fonts e a 9.5.5: `flutter pub get` atualiza.
 - Testar em aparelho, nesta ordem: duplicata falsa (2 arquivos diferentes,
   mesmo nome e tamanho → os dois sobem); data no Drive; apagar com
   localização negada; apagar backup antigo (pede MD5 com barra); queda de
