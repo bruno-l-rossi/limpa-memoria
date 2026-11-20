@@ -8,89 +8,9 @@ import 'package:extension_google_sign_in_as_googleapis_auth/extension_google_sig
 import 'package:googleapis/drive/v3.dart' as drive;
 import 'package:http/http.dart' as http;
 import 'package:photo_manager/photo_manager.dart';
+import 'modelos.dart';
 
-/// Um arquivo pra subir: id (asset.id, vira o taskId), nome, subpasta no Drive,
-/// e (rodada 8) o caminho real no disco e o tamanho, vindos do MediaStore.
-/// Com o caminho real o upload lê o arquivo direto, sem copiar pro cache.
-class ItemBackup {
-  final String id;
-  final String titulo;
-  final String pasta;
-  final String path; // vazio = sem caminho direto, usa o fallback
-  final int bytes; // 0 = desconhecido
-  // Duplicata exata: id do item PRINCIPAL que sobe no lugar deste (mesmo nome
-  // + mesmo tamanho). Item com dup não é enfileirado; quando o principal
-  // confirma, este é marcado como coberto pelo mesmo arquivo do Drive.
-  final String dup;
-
-  ItemBackup(this.id, this.titulo, this.pasta,
-      {this.path = '', this.bytes = 0, this.dup = ''});
-
-  ItemBackup comDup(String novoDup) =>
-      ItemBackup(id, titulo, pasta, path: path, bytes: bytes, dup: novoDup);
-
-  Map<String, String> toMap() => {
-        'id': id,
-        'titulo': titulo,
-        'pasta': pasta,
-        if (path.isNotEmpty) 'path': path,
-        if (bytes > 0) 'bytes': '$bytes',
-        if (dup.isNotEmpty) 'dup': dup,
-      };
-
-  static ItemBackup fromMap(Map<String, String> m) => ItemBackup(
-        m['id'] ?? '',
-        m['titulo'] ?? 'sem nome',
-        m['pasta'] ?? 'Outros',
-        path: m['path'] ?? '',
-        bytes: int.tryParse(m['bytes'] ?? '') ?? 0,
-        dup: m['dup'] ?? '',
-      );
-}
-
-/// Um arquivo como está no Drive (da listagem da pasta Limpa Memória).
-/// Usado pra conferir antes de apagar do celular e pra reconhecer um backup
-/// antigo depois de reinstalar o app.
-class ArquivoDrive {
-  final String fileId;
-  final String nome;
-  final int bytes;
-  final String pasta;
-  ArquivoDrive(this.fileId, this.nome, this.bytes, this.pasta);
-}
-
-/// Metadados que viajam dentro da tarefa do background_downloader.
-/// cache=true significa "o arquivo local é uma cópia no cache do app e pode
-/// ser apagada quando o upload terminar" (nunca apagar o original!).
-class MetaTarefa {
-  final String pasta;
-  final bool cache;
-  final int bytes;
-  final String titulo; // nome no Drive (o filename local pode ser de cache)
-  MetaTarefa(this.pasta, this.cache, this.bytes, {this.titulo = ''});
-
-  String codificar() => jsonEncode({
-        'p': pasta,
-        'c': cache ? 1 : 0,
-        'b': bytes,
-        if (titulo.isNotEmpty) 't': titulo,
-      });
-
-  static MetaTarefa decodificar(String raw) {
-    try {
-      final m = jsonDecode(raw) as Map;
-      return MetaTarefa(
-        m['p']?.toString() ?? 'Outros',
-        (m['c'] as num?)?.toInt() == 1,
-        (m['b'] as num?)?.toInt() ?? 0,
-        titulo: m['t']?.toString() ?? '',
-      );
-    } catch (_) {
-      // metaData das builds antigas era o nome cru da pasta
-      return MetaTarefa(raw.isEmpty ? 'Outros' : raw, false, 0);
-    }
-  }
-}
+export 'modelos.dart';
 
 /// Upload em segundo plano via background_downloader, em JANELA DESLIZANTE.
 ///
@@ -412,11 +332,13 @@ class BackupService {
 
       final subId = await _subpasta(gsi, item.pasta);
 
-      var (sessao, erroSessao) = await _criarSessao(_token!, item.titulo, subId);
+      var (sessao, erroSessao) =
+          await _criarSessao(_token!, item.titulo, subId, data: item.data);
       if (sessao == null && erroSessao == 'token-expirado') {
         final novo = await _renovarToken(gsi);
         if (novo != null) {
-          (sessao, erroSessao) = await _criarSessao(novo, item.titulo, subId);
+          (sessao, erroSessao) =
+              await _criarSessao(novo, item.titulo, subId, data: item.data);
         }
         if (sessao == null && erroSessao == 'token-expirado') {
           erroSessao = '${prefixoRede}login do Google expirou, renovando';
@@ -610,7 +532,7 @@ class BackupService {
               gsi,
               (api) => api.files.list(
                     q: "'$paiId' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false",
-                    $fields: 'nextPageToken, files(id,name,size)',
+                    $fields: 'nextPageToken, files(id,name,size,md5Checksum)',
                     pageSize: 1000,
                     pageToken: pt,
                   ),
@@ -622,6 +544,7 @@ class BackupService {
               f.name ?? '',
               int.tryParse(f.size ?? '') ?? 0,
               paiNome,
+              md5: f.md5Checksum,
             ));
           }
           pageToken = res.nextPageToken;
@@ -639,7 +562,8 @@ class BackupService {
   /// Usado antes de re-subir um arquivo que falhou: às vezes o Drive recebeu
   /// tudo e só a resposta se perdeu. Achou = devolve o fileId e não sobe de
   /// novo (sem duplicata). Qualquer erro = null (aí sobe normal).
-  static Future<String?> acharNoDrive(GoogleSignIn gsi, ItemBackup item) async {
+  static Future<(String, String?)?> acharNoDrive(
+      GoogleSignIn gsi, ItemBackup item) async {
     if (item.bytes <= 0) return null;
     try {
       final (ok, _) = await garantirContexto(gsi);
@@ -649,13 +573,13 @@ class BackupService {
           gsi,
           (api) => api.files.list(
                 q: "name='${_esc(item.titulo)}' and '$sub' in parents and trashed=false",
-                $fields: 'files(id,size)',
+                $fields: 'files(id,size,md5Checksum)',
                 pageSize: 10,
               ),
           tentativas: 2);
       for (final f in res.files ?? const <drive.File>[]) {
         if (f.id != null && int.tryParse(f.size ?? '') == item.bytes) {
-          return f.id;
+          return (f.id!, f.md5Checksum);
         }
       }
     } catch (_) {}
@@ -675,7 +599,11 @@ class BackupService {
   // Rede: retentativa, renovação de token e classificação de erro
   // ---------------------------------------------------------------------------
 
-  static bool _ehTransitorio(Object e) {
+  static bool _ehTransitorio(Object e) => ehTransitorio(e);
+
+  /// Erro de rede/limite (passa sozinho com espera) ou definitivo? Público
+  /// pra teste.
+  static bool ehTransitorio(Object e) {
     if (e is SocketException ||
         e is http.ClientException ||
         e is TimeoutException ||
@@ -784,7 +712,9 @@ class BackupService {
   /// (o Drive limita quantos arquivos por segundo cada conta cria; com 30 mil
   /// fotos pequenas isso aparece).
   static Future<(String?, String?)> _criarSessao(
-      String token, String nome, String folderId) async {
+      String token, String nome, String folderId,
+      {int data = 0}) async {
+    final corpo = metadadosUpload(nome, folderId, data);
     var espera = const Duration(seconds: 2);
     String? ultimo;
     for (var i = 0; i < 5; i++) {
@@ -801,10 +731,7 @@ class BackupService {
                 'Authorization': 'Bearer $token',
                 'Content-Type': 'application/json; charset=UTF-8',
               },
-              body: jsonEncode({
-                'name': nome,
-                'parents': [folderId],
-              }),
+              body: jsonEncode(corpo),
             )
             .timeout(const Duration(seconds: 30));
         final s = resp.statusCode;
@@ -835,6 +762,28 @@ class BackupService {
       }
     }
     return (null, ultimo ?? '${prefixoRede}falha de rede ao preparar');
+  }
+
+  /// Metadados do arquivo novo no Drive. Rodada 12: com a data da mídia
+  /// (modifiedTime e createdTime), senão o Drive mostra tudo com a data do
+  /// upload e, depois de apagar do celular, o "quando" de cada foto se perde.
+  static Map<String, Object> metadadosUpload(
+      String nome, String folderId, int dataMs) {
+    final m = <String, Object>{
+      'name': nome,
+      'parents': [folderId],
+    };
+    // Datas absurdas (0, antes de 1990, no futuro) ficam de fora.
+    final minimo = DateTime.utc(1990).millisecondsSinceEpoch;
+    final maximo =
+        DateTime.now().add(const Duration(days: 2)).millisecondsSinceEpoch;
+    if (dataMs > minimo && dataMs < maximo) {
+      final iso = DateTime.fromMillisecondsSinceEpoch(dataMs, isUtc: true)
+          .toIso8601String();
+      m['modifiedTime'] = iso;
+      m['createdTime'] = iso;
+    }
+    return m;
   }
 
   /// Extrai fileId, tamanho e MD5 da resposta final de um upload concluído.

@@ -1,11 +1,13 @@
 package com.rideblan.limpa_memoria
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
@@ -62,6 +64,7 @@ class MainActivity : FlutterActivity() {
                     }
                     "dirDados" -> result.success(applicationContext.filesDir.absolutePath)
                     "bateriaIsenta" -> result.success(bateriaIsenta())
+                    "localizacaoMidia" -> result.success(localizacaoMidia())
                     "pedirIsencaoBateria" -> {
                         pedirIsencaoBateria()
                         result.success(bateriaIsenta())
@@ -220,6 +223,18 @@ class MainActivity : FlutterActivity() {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             nm.cancel(idNotif)
         } catch (_: Exception) {}
+    }
+
+    /// Permissão de ler o GPS do EXIF (Android 10+). Sem ela o arquivo lido
+    /// vem com a localização apagada.
+    private fun localizacaoMidia(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return true
+        return try {
+            checkSelfPermission(Manifest.permission.ACCESS_MEDIA_LOCATION) ==
+                PackageManager.PERMISSION_GRANTED
+        } catch (_: Exception) {
+            true
+        }
     }
 
     private fun bateriaIsenta(): Boolean {

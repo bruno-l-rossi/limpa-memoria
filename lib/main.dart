@@ -12,6 +12,12 @@ import 'package:background_downloader/background_downloader.dart';
 import 'upload_store.dart';
 import 'backup_service.dart';
 import 'nativo.dart';
+import 'formatos.dart';
+import 'selecao_backup.dart';
+import 'verificacao_apagar.dart';
+import 'telemetria.dart';
+import 'mensagens.dart';
+import 'sugestoes.dart';
 
 void main() => runApp(const MyApp());
 
@@ -77,13 +83,26 @@ class MediaItem {
   int bytes;
   final String pasta;
   String path; // caminho real no disco (MediaStore); vazio se não veio
-  MediaItem(this.asset, this.bytes, this.pasta, {this.path = ''});
+  final String caminhoRel; // relativePath completo (sugestões)
+  MediaItem(this.asset, this.bytes, this.pasta,
+      {this.path = '', this.caminhoRel = ''});
+
+  bool get video => asset.type == AssetType.video;
 
   String get id => asset.id;
   String get titulo => asset.title ?? 'sem nome';
 
+  /// Data da mídia (ms). Vai pro Drive como data do arquivo.
+  int get data {
+    try {
+      return asset.createDateTime.millisecondsSinceEpoch;
+    } catch (_) {
+      return 0;
+    }
+  }
+
   ItemBackup paraBackup() =>
-      ItemBackup(id, titulo, pasta, path: path, bytes: bytes);
+      ItemBackup(id, titulo, pasta, path: path, bytes: bytes, data: data);
 }
 
 class Pasta {
@@ -151,6 +170,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final Set<MediaItem> _selected = {};
   String _ordem = 'tamanho'; // 'tamanho' ou 'data'
   String _filtro = 'todos'; // 'todos' | 'drive' | 'foradrive'
+  String _tipo = 'todos'; // 'todos' | 'fotos' | 'videos'
+  bool _permissaoNegada = false;
 
   bool _calculando = false;
   int _lidos = 0;
@@ -194,6 +215,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final Set<String> _emFila = {}; // total estável da sessão (denominador)
   final Map<String, ItemBackup> _itemDoJob = {}; // id -> item da sessão
   final Map<String, ItemBackup> _falhos = {}; // falha definitiva (botão retry)
+  final Map<String, String> _motivoFalha = {}; // id -> motivo (lista de falhas)
   String? _erroBg; // último motivo de erro, pra mostrar na tela
   bool _pausado = false; // backup pausado (pelo usuário ou por Drive cheio)
   bool _driveCheio = false; // pausa automática por cota estourada
@@ -258,6 +280,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // Integridade: MD5 conferido até este tamanho (acima disso, vale o tamanho).
   static const int _tetoMd5 = 256 * 1024 * 1024;
 
+  // Números da sessão por faixa de tamanho (diagnóstico local).
+  final Telemetria _telemetria = Telemetria();
+
   // ---------------------------------------------------------------------------
   // Estatísticas cacheadas
   // ---------------------------------------------------------------------------
@@ -267,6 +292,94 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// Diário de eventos do motor (arquivo local, nada sai do celular sem o
   /// usuário tocar em Compartilhar). É o que transforma "travou" em dado.
   void _ev(String texto) => _store.registrarEvento(texto);
+
+  void _avisar(String texto) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(texto)));
+  }
+
+  // MD5 local por id (cache da execução: o arquivo não muda enquanto o app
+  // está aberto; se mudar, o tamanho muda e a conferência pega).
+  final Map<String, String> _md5Cache = {};
+
+  /// MD5 de vários arquivos, 2 por vez (o pool nativo tem 2 threads), com
+  /// diálogo de progresso quando são muitos. Devolve id -> MD5 dos que deu
+  /// pra calcular, ou null se o usuário cancelou.
+  Future<Map<String, String>?> _md5DeVarios(List<ItemBackup> itens,
+      {required String titulo}) async {
+    final res = <String, String>{};
+    final faltam = <ItemBackup>[];
+    for (final it in itens) {
+      final c = _md5Cache[it.id];
+      if (c != null) {
+        res[it.id] = c;
+      } else if (it.path.isNotEmpty) {
+        faltam.add(it);
+      }
+    }
+    if (faltam.isEmpty) return res;
+    final progresso = ValueNotifier<double>(0);
+    var cancelado = false;
+    var dialogoAberto = false;
+    NavigatorState? nav;
+    // Só mostra diálogo se vai demorar (muitos arquivos ou muitos bytes).
+    final totalBytes = faltam.fold<int>(0, (s, i) => s + i.bytes);
+    if (mounted && (faltam.length > 20 || totalBytes > 200 * 1024 * 1024)) {
+      nav = Navigator.of(context, rootNavigator: true);
+      dialogoAberto = true;
+      unawaited(showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        useRootNavigator: true,
+        builder: (ctx) => PopScope(
+          canPop: false,
+          child: AlertDialog(
+            title: Text(titulo),
+            content: ValueListenableBuilder<double>(
+              valueListenable: progresso,
+              builder: (_, v, __) => Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  LinearProgressIndicator(value: v),
+                  const SizedBox(height: 8),
+                  Text('${(v * 100).round()}%',
+                      style: const TextStyle(color: _inkMuted)),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                  onPressed: () {
+                    cancelado = true;
+                    Navigator.pop(ctx);
+                  },
+                  child: const Text('Cancelar')),
+            ],
+          ),
+        ),
+      ).then((_) => dialogoAberto = false));
+    }
+    var i = 0, feitos = 0;
+    Future<void> trabalhador() async {
+      while (!cancelado && i < faltam.length) {
+        final it = faltam[i++];
+        final m = await Nativo.md5(it.path);
+        if (m != null) {
+          _md5Cache[it.id] = m;
+          res[it.id] = m;
+        }
+        feitos++;
+        progresso.value = feitos / faltam.length;
+      }
+    }
+
+    await Future.wait([trabalhador(), trabalhador()]);
+    if (dialogoAberto && !cancelado) nav?.pop();
+    progresso.dispose();
+    if (cancelado) return null;
+    _ev('MD5 de ${faltam.length} arquivos (${_fmt(totalBytes)})');
+    return res;
+  }
 
   void _calcStats() {
     if (_statsRev == _rev) return;
@@ -544,10 +657,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     for (final cob in dups) {
       if (_enviadosIds.contains(cob.id)) continue;
       if (!_enviadosIds.contains(cob.dup)) continue;
+      final principal = _store.envioDe(cob.dup);
       lote.add((
         id: cob.id,
-        fileId: _store.envioDe(cob.dup)?.fileId,
+        fileId: principal?.fileId,
         bytes: cob.bytes > 0 ? cob.bytes : null,
+        // MD5 igual ao do principal (é a regra da duplicata): se o principal
+        // foi conferido no Drive, este também está.
+        verificado: principal?.verificado ?? false,
       ));
       _enviadosIds.add(cob.id);
     }
@@ -560,19 +677,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// Marca um arquivo como confirmado no Drive: store, contagem, velocidade,
   /// cobertura das duplicatas e limpeza do registro no banco da biblioteca.
   Future<void> _confirmarEnvio(String id, String? fileId, int? bytes,
-      {bool contarVelocidade = true}) async {
+      {bool contarVelocidade = true, bool verificado = false}) async {
     if (_enviadosIds.contains(id)) {
       // Já contado (ex.: a reconciliação viu antes do evento). Se agora veio
       // o fileId do Drive, guarda: é ele que libera o apagar com segurança.
       if (fileId != null) {
-        await _store.marcarEnviado(id, fileId: fileId, bytes: bytes);
+        await _store.marcarEnviado(id,
+            fileId: fileId, bytes: bytes, verificado: verificado);
         final cobertos = _dupsDe[id];
         if (cobertos != null) {
           await _store.marcarEnviadosEmLote([
             for (final c in cobertos)
               if (_enviadosIds.contains(c.id) &&
                   _store.envioDe(c.id)?.fileId == null)
-                (id: c.id, fileId: fileId, bytes: null)
+                (id: c.id, fileId: fileId, bytes: null, verificado: verificado)
           ]);
         }
       }
@@ -587,10 +705,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _tentativasRede.remove(id);
     _ausentesDesde.remove(id);
     final b = bytes ?? _bytesPorId[id] ?? 0;
-    await _store.marcarEnviado(id, fileId: fileId, bytes: b > 0 ? b : null);
+    await _store.marcarEnviado(id,
+        fileId: fileId, bytes: b > 0 ? b : null, verificado: verificado);
     if (contarVelocidade && _emFila.contains(id) && b > 0) {
       _amostras.add((DateTime.now(), b));
       _bytesSessao += b;
+      _telemetria.registrar(b);
     }
     _paraLimpar[id] = DateTime.now();
     _arquivosSessao++;
@@ -605,6 +725,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           id: cob.id,
           fileId: fileId,
           bytes: cob.bytes > 0 ? cob.bytes : null,
+          verificado: verificado,
         ));
         _enviadosIds.add(cob.id);
       }
@@ -634,6 +755,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       'bytes': bytesTotal,
       'falhas': 0,
       'ultimoErro': _erroBg,
+      ..._telemetria.resumo(),
     });
     _store.limparJob();
     _erroBg = null;
@@ -657,6 +779,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       'bytes': _cBytesTotal,
       'falhas': _bgTotal - _cFeitos,
       'ultimoErro': _erroBg,
+      ..._telemetria.resumo(),
     });
     _ev('Backup parou com falhas: $_cFeitos de $_bgTotal · ${_falhos.length} falhos · último erro: ${_erroBg ?? '-'}');
   }
@@ -762,13 +885,27 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           final jaTentou = (_tentativas[item.id] ?? 0) > 0 ||
               (_tentativasRede[item.id] ?? 0) > 0;
           if (jaTentou && !_corrompidos.contains(item.id)) {
-            final fid = await BackupService.acharNoDrive(_gsi, item);
-            if (fid != null) {
-              return (item: item, ok: false, erro: '$_prefixoJa$fid');
+            final achado = await BackupService.acharNoDrive(_gsi, item);
+            if (achado != null) {
+              final (fid, md5Drive) = achado;
+              // Confere o conteúdo quando dá: MD5 diferente = é outro arquivo
+              // com o mesmo nome e tamanho; sobe normalmente.
+              String? md5Local;
+              if (md5Drive != null &&
+                  item.path.isNotEmpty &&
+                  item.bytes <= _tetoMd5) {
+                md5Local = _md5Cache[item.id] ?? await Nativo.md5(item.path);
+              }
+              if (md5Local == null || md5Local == md5Drive) {
+                final v = md5Local != null ? 'v' : '';
+                return (item: item, ok: false, erro: '$_prefixoJa$v:$fid');
+              }
             }
           }
+          final t0 = DateTime.now();
           final (ok, erro) =
               await BackupService.enfileirarUm(_gsi, item, soWifi: _soWifi);
+          _telemetria.preparo(DateTime.now().difference(t0));
           return (item: item, ok: ok, erro: erro);
         }));
         var driveCheio = false;
@@ -787,9 +924,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           if (erro != null && erro.startsWith(_prefixoJa)) {
             // Já estava no Drive: confirma sem subir.
             _ev('Já estava no Drive (resposta perdida antes): "${r.item.titulo}"');
+            final resto = erro.substring(_prefixoJa.length);
+            final sep = resto.indexOf(':');
             await _confirmarEnvio(
-                id, erro.substring(_prefixoJa.length), r.item.bytes,
-                contarVelocidade: false);
+                id, resto.substring(sep + 1), r.item.bytes,
+                contarVelocidade: false,
+                verificado: resto.substring(0, sep) == 'v');
             algumOk = true;
             continue;
           }
@@ -811,6 +951,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               _porNaFila(r.item); // volta pro fim da fila
             } else {
               _falhos[id] = r.item;
+              _motivoFalha[id] = mensagemAmigavel(erro);
+              _telemetria.falhasDefinitivas++;
               if (erro != null && erro.isNotEmpty) _erroBg = erro;
               _ev('Falhou ao preparar: "${r.item.titulo}" · $erro');
             }
@@ -1001,6 +1143,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       'Nesta execução: ${_milhar(_arquivosSessao)} arquivos, ${_fmt(_bytesSessao)} · ${_fmt(_velocidade.round())}/s',
       'Bateria isenta: ${isenta ? 'sim' : 'NÃO'} · só wifi: ${_soWifi ? 'sim' : 'não'}',
       'Último erro: ${_erroBg ?? '-'}',
+      '',
+      'Por tamanho (nesta execução):',
+      _telemetria.texto(),
     ].join('\n');
     final ultimos = eventos.reversed.take(60).join('\n');
     await showDialog<void>(
@@ -1088,44 +1233,30 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// Sugestões de seleção (estilo Files by Google): grupos prontos com o
   /// quanto cada um libera. Heurísticas baratas de pasta, tamanho e data.
   Future<void> _abrirSugestoes() async {
-    final agora = DateTime.now();
-    final umAno = agora.subtract(const Duration(days: 365));
-    final fora = _items.where((m) => !_enviadosIds.contains(m.id)).toList();
-
-    List<MediaItem> grupo(bool Function(MediaItem) f) => fora.where(f).toList();
-    final grupos = <(String, String, List<MediaItem>, int)>[];
-    void add(String titulo, String desc, List<MediaItem> itens) {
-      if (itens.isNotEmpty) {
-        grupos.add(
-            (titulo, desc, itens, itens.fold<int>(0, (s, m) => s + m.bytes)));
-      }
-    }
-
-    add(
-        'Vídeos grandes',
-        'Acima de 100 MB',
-        grupo((m) =>
-            m.asset.type == AssetType.video && m.bytes > 100 * 1024 * 1024));
-    add('WhatsApp', 'Fotos e vídeos recebidos',
-        grupo((m) => m.pasta.toLowerCase().contains('whatsapp')));
-    add('Mais antigos que 1 ano', 'Você quase não abre',
-        grupo((m) => m.asset.createDateTime.isBefore(umAno)));
-    add('Screenshots', 'Capturas de tela',
-        grupo((m) => m.pasta.toLowerCase().contains('screenshot')));
-
-    if (grupos.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text(
-              'Nada óbvio pra sugerir: tudo que sobrou é recente e pequeno. Use a lista pra escolher.')));
-      return;
-    }
+    // Sem conta: abre o login aqui mesmo e segue (antes só avisava).
     if (_conta == null) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Entre com o Google primeiro (ícone lá em cima).')));
+      await _login();
+      if (_conta == null || !mounted) return;
+    }
+    final fora = [
+      for (final m in _items)
+        if (!_enviadosIds.contains(m.id)) m
+    ];
+    final porId = {for (final m in fora) m.id: m};
+    final grupos = montarSugestoes([
+      for (final m in fora)
+        MidiaSugestao(m.id, m.video, m.bytes, m.caminhoRel,
+            m.asset.createDateTime)
+    ]);
+    final bytesFora = fora.fold<int>(0, (s, m) => s + m.bytes);
+
+    if (fora.isEmpty) {
+      _avisar('Tudo que está no celular já está no Drive.');
       return;
     }
 
     final marcados = <int>{for (var i = 0; i < grupos.length; i++) i};
+    var tudo = grupos.isEmpty; // sem sugestão óbvia: oferece "tudo"
     if (!mounted) return;
     await showModalBottomSheet<void>(
       context: context,
@@ -1133,63 +1264,84 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setSheet) {
           final selecionados = <MediaItem>{};
-          for (final i in marcados) {
-            selecionados.addAll(grupos[i].$3);
+          if (tudo) {
+            selecionados.addAll(fora);
+          } else {
+            for (final i in marcados) {
+              for (final id in grupos[i].ids) {
+                final m = porId[id];
+                if (m != null) selecionados.add(m);
+              }
+            }
           }
           final bytes = selecionados.fold<int>(0, (s, m) => s + m.bytes);
           return SafeArea(
             child: Padding(
               padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('O que guardar no Drive?',
-                      style:
-                          TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
-                  const SizedBox(height: 4),
-                  const Text(
-                      'Sugestões prontas. Desmarque o que quiser manter só no celular.',
-                      style: TextStyle(fontSize: 13, color: _inkMuted)),
-                  const SizedBox(height: 8),
-                  ...List.generate(grupos.length, (i) {
-                    final (titulo, desc, itens, gb) = grupos[i];
-                    return CheckboxListTile(
-                      value: marcados.contains(i),
-                      onChanged: (v) => setSheet(() {
-                        if (v == true) {
-                          marcados.add(i);
-                        } else {
-                          marcados.remove(i);
-                        }
-                      }),
-                      title: Text(titulo),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('O que guardar no Drive?',
+                        style: TextStyle(
+                            fontSize: 18, fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 4),
+                    Text(
+                        grupos.isEmpty
+                            ? 'Nada óbvio pra sugerir. Dá pra guardar tudo que ainda falta.'
+                            : 'Sugestões prontas. Um arquivo pode estar em mais de um grupo, mas só sobe uma vez.',
+                        style:
+                            const TextStyle(fontSize: 13, color: _inkMuted)),
+                    const SizedBox(height: 8),
+                    SwitchListTile(
+                      value: tudo,
+                      onChanged: (v) => setSheet(() => tudo = v),
+                      title: const Text('Tudo que ainda não está no Drive'),
                       subtitle: Text(
-                          '$desc · ${_milhar(itens.length)} arquivos · ${_fmt(gb)}'),
+                          '${_milhar(fora.length)} arquivos · ${_fmt(bytesFora)}'),
                       contentPadding: EdgeInsets.zero,
-                    );
-                  }),
-                  const SizedBox(height: 8),
-                  SizedBox(
-                    width: double.infinity,
-                    child: FilledButton(
-                      onPressed: selecionados.isEmpty
-                          ? null
-                          : () {
-                              Navigator.pop(ctx);
-                              setState(() {
-                                _selected
-                                  ..clear()
-                                  ..addAll(selecionados);
-                              });
-                              _subir();
-                            },
-                      child: Text(selecionados.isEmpty
-                          ? 'Nada marcado'
-                          : 'Subir ${_milhar(selecionados.length)} arquivos (${_fmt(bytes)})'),
                     ),
-                  ),
-                ],
+                    if (!tudo)
+                      ...List.generate(grupos.length, (i) {
+                        final g = grupos[i];
+                        return CheckboxListTile(
+                          value: marcados.contains(i),
+                          onChanged: (v) => setSheet(() {
+                            if (v == true) {
+                              marcados.add(i);
+                            } else {
+                              marcados.remove(i);
+                            }
+                          }),
+                          title: Text(g.titulo),
+                          subtitle: Text(
+                              '${g.descricao} · ${_milhar(g.ids.length)} arquivos · ${_fmt(g.bytes)}'),
+                          contentPadding: EdgeInsets.zero,
+                        );
+                      }),
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton(
+                        onPressed: selecionados.isEmpty
+                            ? null
+                            : () {
+                                Navigator.pop(ctx);
+                                setState(() {
+                                  _selected
+                                    ..clear()
+                                    ..addAll(selecionados);
+                                });
+                                _subir();
+                              },
+                        child: Text(selecionados.isEmpty
+                            ? 'Nada marcado'
+                            : 'Guardar ${_milhar(selecionados.length)} arquivos (${_fmt(bytes)})'),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           );
@@ -1344,18 +1496,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Future<List<ItemBackup>?> _apararPraCaber(
       List<ItemBackup> pendentes, int precisa, int livre) async {
-    const margem = 200 * 1024 * 1024; // 200 MB de folga
-    final orcamento = livre - margem;
-    final ordenados = List<ItemBackup>.from(pendentes)
-      ..sort((a, b) => b.bytes.compareTo(a.bytes));
-    final cabem = <ItemBackup>[];
-    var soma = 0;
-    for (final it in ordenados) {
-      if (it.bytes <= 0) continue;
-      if (soma + it.bytes > orcamento) continue;
-      soma += it.bytes;
-      cabem.add(it);
-    }
+    final (cabem, soma) = apararPraCaber(pendentes, livre);
     if (!mounted) return null;
     if (cabem.isEmpty) {
       await showDialog<void>(
@@ -1413,7 +1554,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     for (final it in lista) {
       final a = porChave['${it.titulo}|${it.pasta}|${it.bytes}'];
       if (a == null) continue;
-      novos.add((id: it.id, fileId: a.fileId, bytes: it.bytes));
+      // Só nome+pasta+tamanho: NÃO verificado. O apagar confere o MD5 antes
+      // de tirar do celular, e devolve pro backup se não bater.
+      novos.add((id: it.id, fileId: a.fileId, bytes: it.bytes, verificado: false));
       _enviadosIds.add(it.id);
     }
     if (novos.isEmpty) return 0;
@@ -1503,27 +1646,33 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return;
     }
 
-    // Duplicatas exatas (mesmo nome + mesmo tamanho, clássico do WhatsApp):
-    // sobe 1, as outras são cobertas pelo mesmo arquivo do Drive. Arquivo
-    // igual que JÁ subiu antes também serve de principal.
-    final porChaveDup = <String, String>{}; // titulo|bytes -> id do principal
-    for (final m in _items) {
-      if (m.bytes > 0 && _enviadosIds.contains(m.id)) {
-        porChaveDup.putIfAbsent('${m.titulo}|${m.bytes}', () => m.id);
-      }
-    }
-    var duplicatas = 0;
-    pendentesItens = pendentesItens.map((it) {
-      if (it.bytes <= 0) return it;
-      final chave = '${it.titulo}|${it.bytes}';
-      final principal = porChaveDup[chave];
-      if (principal == null) {
-        porChaveDup[chave] = it.id;
-        return it;
-      }
-      duplicatas++;
-      return it.comDup(principal);
-    }).toList();
+    // Duplicatas exatas (clássico do WhatsApp): sobe 1, as outras são
+    // cobertas pelo mesmo arquivo do Drive. Rodada 12: só é duplicata se o
+    // MD5 for igual. Antes bastava nome + tamanho, e um arquivo DIFERENTE com
+    // o mesmo nome e tamanho era marcado como salvo sem nunca subir.
+    final enviadosNoCelular = [
+      for (final m in _items)
+        if (m.bytes > 0 && _enviadosIds.contains(m.id)) m.paraBackup()
+    ];
+    final grupos = gruposCandidatos<ItemBackup>(
+        [...pendentesItens, ...enviadosNoCelular],
+        (i) => i.titulo,
+        (i) => i.bytes);
+    final paraMd5 = [
+      for (final g in grupos)
+        for (final it in g)
+          if (it.path.isNotEmpty && it.bytes <= _tetoMd5) it
+    ];
+    final md5s = await _md5DeVarios(paraMd5,
+        titulo: 'Conferindo arquivos repetidos…');
+    if (md5s == null) return; // usuário cancelou
+    final jaEnviados = <String, String>{
+      for (final it in enviadosNoCelular)
+        if (md5s[it.id] != null) chaveDup(it.titulo, it.bytes, md5s[it.id]): it.id
+    };
+    final (comDups, duplicatas) =
+        marcarDuplicatas(pendentesItens, jaEnviados: jaEnviados, md5: md5s);
+    pendentesItens = comDups;
 
     // Checa espaço: só o que de fato sobe (duplicata coberta não conta).
     final precisa = pendentesItens
@@ -1536,12 +1685,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       if (aparados == null || aparados.isEmpty) return;
       final idsAparados = aparados.map((e) => e.id).toSet();
       // Ficam: os aparados + as duplicatas cujo principal ficou (ou já subiu).
-      pendentesItens = pendentesItens
-          .where((it) => it.dup.isEmpty
-              ? idsAparados.contains(it.id)
-              : (idsAparados.contains(it.dup) ||
-                  _enviadosIds.contains(it.dup)))
-          .toList();
+      pendentesItens =
+          manterAparados(pendentesItens, idsAparados, _enviadosIds.contains);
     }
     mergedItens = [
       ...mergedItens.where((it) => _enviadosIds.contains(it.id)),
@@ -1573,6 +1718,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _bytesSessao = 0;
       _arquivosSessao = 0;
       _inicioSessao = DateTime.now();
+      _telemetria.zerar();
       _celebrado = false;
       _fimRegistrado = false;
       _semeado = true;
@@ -1731,6 +1877,33 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
     if (confirma != true || !mounted) return;
 
+    // Sem a permissão de localização da mídia, o Android entrega as fotos SEM
+    // o GPS do EXIF: o que subiu pode estar sem o "onde". Não apaga assim.
+    if (!await Nativo.localizacaoMidiaPermitida()) {
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Falta uma permissão'),
+          content: const Text(
+              'O app não tem acesso à localização das fotos. Sem ela, o Android entrega as fotos sem o lugar onde foram tiradas, e o backup pode ter ido sem essa informação.\n\nPor segurança, nada é apagado enquanto essa permissão estiver desligada. Libere em Ajustes > Permissões > Fotos e vídeos.'),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Agora não')),
+            FilledButton(
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  PhotoManager.openSetting();
+                },
+                child: const Text('Abrir ajustes')),
+          ],
+        ),
+      );
+      return;
+    }
+    if (!mounted) return;
+
     final nav = Navigator.of(context, rootNavigator: true);
     showDialog(
       context: context,
@@ -1753,54 +1926,89 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     nav.pop(); // fecha o "conferindo"
     if (!mounted) return;
     if (noDrive == null) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text(
-              'Não consegui conferir no Drive (internet?). Sem conferência, nada é apagado.')));
-      return;
-    }
-    final tamPorFileId = <String, int>{};
-    final porChave = <String, int>{}; // nome|pasta|bytes -> quantos existem
-    for (final a in noDrive) {
-      tamPorFileId[a.fileId] = a.bytes;
-      final chave = '${a.nome}|${a.pasta}|${a.bytes}';
-      porChave[chave] = (porChave[chave] ?? 0) + 1;
-    }
-    final verificados = <String>[];
-    var naoConferidos = 0;
-    for (final id in candidatos) {
-      final info = _store.envioDe(id);
-      final item = itemPorId[id]!;
-      final fid = info?.fileId;
-      var ok = false;
-      if (fid != null) {
-        final tam = tamPorFileId[fid];
-        // Confere o tamanho do Drive contra o enviado E contra o arquivo
-        // que está no celular agora (se mudou depois do backup, fica).
-        final esperado = item.bytes > 0 ? item.bytes : info?.bytes;
-        ok = tam != null &&
-            (esperado == null || tam == esperado) &&
-            (info?.bytes == null || tam == info!.bytes);
-      } else {
-        final chave = '${item.titulo}|${item.pasta}|${item.bytes}';
-        final quantos = porChave[chave] ?? 0;
-        if (quantos > 0 && item.bytes > 0) {
-          porChave[chave] = quantos - 1;
-          ok = true;
-        }
-      }
-      if (ok) {
-        verificados.add(id);
-      } else {
-        naoConferidos++;
-      }
-    }
-    if (verificados.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text(
-              'Não consegui conferir nenhum arquivo no Drive. Nada foi apagado.')));
+      _avisar(
+          'Não consegui conferir no Drive (internet?). Sem conferência, nada é apagado.');
       return;
     }
 
+    // Monta os candidatos e calcula o MD5 local de quem ainda não foi
+    // conferido por conteúdo (backups antigos, reconhecidos por nome,
+    // concluídos com o app fechado).
+    var candidatosApagar = [
+      for (final id in candidatos)
+        () {
+          final item = itemPorId[id]!;
+          final info = _store.envioDe(id);
+          return CandidatoApagar(
+            id: id,
+            titulo: item.titulo,
+            pasta: item.pasta,
+            bytesAgora: item.bytes,
+            fileId: info?.fileId,
+            bytesEnviados: info?.bytes,
+            verificado: info?.verificado ?? false,
+          );
+        }()
+    ];
+    final paraMd5 = [
+      for (final c in candidatosApagar)
+        if (precisaMd5(c, _tetoMd5)) itemPorId[c.id]!.paraBackup()
+    ];
+    if (paraMd5.isNotEmpty) {
+      final md5s =
+          await _md5DeVarios(paraMd5, titulo: 'Conferindo o conteúdo…');
+      if (md5s == null || !mounted) return; // cancelou: nada apagado
+      candidatosApagar = [
+        for (final c in candidatosApagar)
+          md5s[c.id] == null
+              ? c
+              : CandidatoApagar(
+                  id: c.id,
+                  titulo: c.titulo,
+                  pasta: c.pasta,
+                  bytesAgora: c.bytesAgora,
+                  fileId: c.fileId,
+                  bytesEnviados: c.bytesEnviados,
+                  verificado: c.verificado,
+                  md5Local: md5s[c.id],
+                )
+      ];
+    }
+    final decisao =
+        decidirApagar(candidatosApagar, noDrive, tetoMd5: _tetoMd5);
+    final verificados = decisao.pode;
+    final naoConferidos = decisao.fica.length;
+
+    // O que NÃO está no Drive de verdade (sumiu de lá, ou é outro arquivo com
+    // o mesmo nome) volta a ser "fora do Drive" pra subir no próximo backup.
+    // Sem isso ficava marcado como salvo pra sempre sem estar.
+    final voltam = [
+      for (final e in decisao.fica.entries)
+        if (e.value == MotivoFica.naoAchado ||
+            e.value == MotivoFica.md5Diferente)
+          e.key
+    ];
+    if (voltam.isNotEmpty) {
+      await _store.esquecerEnviados(voltam);
+      setState(() {
+        _enviadosIds.removeAll(voltam);
+        _mudou();
+      });
+      _ev('Apagar: ${voltam.length} marcados como salvos não estavam no Drive; voltaram pro backup');
+    }
+    final motivos = <MotivoFica, int>{};
+    for (final m in decisao.fica.values) {
+      motivos[m] = (motivos[m] ?? 0) + 1;
+    }
+    if (motivos.isNotEmpty) {
+      _ev('Apagar: ficaram ${motivos.entries.map((e) => '${e.key.name}=${e.value}').join(' ')}');
+    }
+    if (verificados.isEmpty) {
+      _avisar(voltam.isNotEmpty
+          ? 'Nada foi apagado. ${_milhar(voltam.length)} arquivos não estavam no Drive de verdade e voltaram pra lista do backup.'
+          : 'Não consegui conferir nenhum arquivo no Drive. Nada foi apagado.');
+      return;
+    }
     // Lotes que cabem no limite do Android. Usuário recusou um lote = para.
     // Erro num lote (ex.: um arquivo sumiu no meio) = tenta em lotes menores.
     final apagadosAll = <String>[];
@@ -1933,7 +2141,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           .toSet();
       if (concluidos.isNotEmpty) {
         await _store.marcarEnviadosEmLote(
-            [for (final id in concluidos) (id: id, fileId: null, bytes: null)]);
+            [
+              for (final id in concluidos)
+                (id: id, fileId: null, bytes: null, verificado: false)
+            ]);
         _enviadosIds.addAll(concluidos);
         final agora = DateTime.now();
         for (final id in concluidos) {
@@ -2107,6 +2318,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       // Integridade: o tamanho no Drive tem que bater com o arquivo local
       // (vale pra todos, inclusive vídeos grandes). E até 256 MB confere o
       // MD5 local contra o que o Drive calculou. Divergiu = refaz o upload.
+      var verificou = false;
       if (!_enviadosIds.contains(id) && (bytes != null || md5Drive != null)) {
         String? motivo;
         try {
@@ -2121,6 +2333,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               local <= _tetoMd5) {
             final md5Local = await Nativo.md5(caminho);
             if (md5Local != null && md5Local != md5Drive) motivo = 'md5';
+            if (md5Local != null && md5Local == md5Drive) {
+              verificou = true;
+              _md5Cache[id] = md5Local;
+            }
           }
         } catch (_) {
           // sem conferência local não bloqueia: o tamanho do Drive vale
@@ -2141,6 +2357,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             _erroBg = 'Um arquivo chegou diferente no Drive; refazendo.';
           } else {
             _falhos[id] = item;
+            _motivoFalha[id] = 'Chegou diferente no Drive 3 vezes';
+            _telemetria.falhasDefinitivas++;
             _erroBg =
                 '"${item.titulo}" chegou diferente no Drive 3 vezes (${meta.pasta}).';
           }
@@ -2150,7 +2368,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         }
       }
 
-      await _confirmarEnvio(id, fileId, bytes);
+      await _confirmarEnvio(id, fileId, bytes, verificado: verificou);
       await BackupService.apagarCopiaDeCache(update.task);
     } finally {
       _processando.remove(id);
@@ -2191,6 +2409,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       // tentativa normal: espera e tenta de novo, até 20x.
       final tr = (_tentativasRede[id] ?? 0) + 1;
       _tentativasRede[id] = tr;
+      _telemetria.retentativasRede++;
       if (tr <= 20) {
         _porNaFila(item, frente: true);
         _esperarRede();
@@ -2204,7 +2423,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _porNaFila(item);
     } else {
       _falhos[id] = item;
+      _telemetria.falhasDefinitivas++;
       final desc = exc?.description;
+      _motivoFalha[id] = mensagemAmigavel(
+          '${desc ?? ''} ${codigo > 0 ? 'HTTP $codigo' : ''} ${exc.runtimeType}');
       if (desc != null && desc.isNotEmpty) _erroBg = desc;
       _ev('Falhou de vez: "${item.titulo}" (${item.pasta}) · ${exc.runtimeType} $codigo · ${desc ?? ''}');
     }
@@ -2265,7 +2487,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       final assets = await all.getAssetListRange(start: inicio, end: fim);
       final primeira = inicio == 0;
       inicio = fim;
-      items.addAll([for (final a in assets) MediaItem(a, 0, _nomePasta(a))]);
+      items.addAll([
+        for (final a in assets)
+          MediaItem(a, 0, _nomePasta(a), caminhoRel: a.relativePath ?? '')
+      ]);
       if (primeira && mounted) {
         setState(() {
           _loading = false;
@@ -2404,29 +2629,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return lista;
   }
 
-  String _fmt(int bytes) {
-    if (bytes <= 0) return '0 MB';
-    const u = ['B', 'KB', 'MB', 'GB', 'TB'];
-    double v = bytes.toDouble();
-    int i = 0;
-    while (v >= 1024 && i < u.length - 1) {
-      v /= 1024;
-      i++;
-    }
-    final txt = i == 0 ? v.toStringAsFixed(0) : v.toStringAsFixed(1);
-    return '${txt.replaceAll('.', ',')} ${u[i]}';
-  }
-
-  /// 19000 -> "19.000"
-  String _milhar(int n) {
-    final s = n.abs().toString();
-    final buf = StringBuffer(n < 0 ? '-' : '');
-    for (var i = 0; i < s.length; i++) {
-      if (i > 0 && (s.length - i) % 3 == 0) buf.write('.');
-      buf.write(s[i]);
-    }
-    return buf.toString();
-  }
+  String _fmt(int bytes) => fmtBytes(bytes);
+  String _milhar(int n) => milhar(n);
 
   int get _totalSelecionado => _selected.fold(0, (s, i) => s + i.bytes);
 
@@ -2485,22 +2689,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return janela >= 30 ? peq.length / janela : 0;
   }
 
-  String _eta(int bytesRestantes) {
-    final v = _velocidade;
-    if (v <= 0 || bytesRestantes <= 0) return '';
-    var segs = bytesRestantes / v;
-    final fps = _pequenosPorSeg;
-    if (fps > 0 && _cPequenosRestantes > 0) {
-      segs = max(segs, _cPequenosRestantes / fps);
-    }
-    final s = segs.round();
-    if (s < 90) return '~1 min restante';
-    if (s < 3600) return '~${(s / 60).round()} min restantes';
-    final h = s ~/ 3600;
-    final m = ((s % 3600) / 60).round();
-    if (h >= 48) return '~${(h / 24).round()} dias restantes';
-    return '~${h}h${m.toString().padLeft(2, '0')} restantes';
-  }
+  String _eta(int bytesRestantes) => textoEta(estimarSegundos(
+        bytesRestantes: bytesRestantes,
+        bytesPorSeg: _velocidade,
+        pequenosRestantes: _cPequenosRestantes,
+        pequenosPorSeg: _pequenosPorSeg,
+      ));
 
   // ---------------------------------------------------------------------------
   // UI

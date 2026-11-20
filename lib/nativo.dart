@@ -94,6 +94,17 @@ class Nativo {
     }
   }
 
+  /// O app tem a permissão de ler a LOCALIZAÇÃO das mídias? Sem ela o
+  /// Android entrega as fotos sem o GPS do EXIF. Em erro devolve true pra não
+  /// travar aparelhos sem o canal (o Android antigo nem tem essa permissão).
+  static Future<bool> localizacaoMidiaPermitida() async {
+    try {
+      return await _canal.invokeMethod<bool>('localizacaoMidia') ?? true;
+    } catch (_) {
+      return true;
+    }
+  }
+
   /// Share sheet do Android com um texto.
   static Future<void> compartilhar(String texto) async {
     try {
