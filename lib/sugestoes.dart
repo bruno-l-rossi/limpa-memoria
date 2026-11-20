@@ -49,8 +49,11 @@ List<GrupoSugestao> montarSugestoes(List<MidiaSugestao> fora,
 
   add('Vídeos grandes', 'Acima de 100 MB',
       (m) => m.video && m.bytes > videoGrande);
-  add('WhatsApp', 'Fotos e vídeos recebidos e enviados',
-      (m) => ehWhatsApp(m.caminho));
+  // Rodada 18: vídeos do WhatsApp em grupo próprio (são o grosso do espaço).
+  add('Vídeos do WhatsApp', 'Recebidos e enviados',
+      (m) => m.video && ehWhatsApp(m.caminho));
+  add('Fotos do WhatsApp', 'Recebidas e enviadas',
+      (m) => !m.video && ehWhatsApp(m.caminho));
   add('Mais antigos que 1 ano', 'Você quase não abre',
       (m) => m.data.isBefore(umAno));
   add('Screenshots', 'Capturas e gravações de tela',

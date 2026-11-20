@@ -65,6 +65,8 @@ class MainActivity : FlutterActivity() {
                     "dirDados" -> result.success(applicationContext.filesDir.absolutePath)
                     "bateriaIsenta" -> result.success(bateriaIsenta())
                     "localizacaoMidia" -> result.success(localizacaoMidia())
+                    // Rodada 18: a lixeira do sistema só existe no Android 11+.
+                    "sdk" -> result.success(android.os.Build.VERSION.SDK_INT)
                     "pedirIsencaoBateria" -> {
                         pedirIsencaoBateria()
                         result.success(bateriaIsenta())

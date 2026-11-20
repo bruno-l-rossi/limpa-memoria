@@ -79,4 +79,13 @@ void main() {
     expect(r.pode, ['1']);
     expect(r.fica['2'], MotivoFica.naoAchado);
   });
+
+  test('sem fileId: acha na pasta de nome antigo (antes da rodada 18)', () {
+    final r = decidirApagar([
+      c('1', md5: 'aaa', pasta: 'WhatsApp Images › Sent'),
+    ], [
+      ArquivoDrive('f1', 'IMG.jpg', 100, 'Sent', md5: 'aaa'),
+    ], tetoMd5: teto);
+    expect(r.pode, ['1']);
+  });
 }

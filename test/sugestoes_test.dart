@@ -9,8 +9,19 @@ void main() {
           'Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images/Sent/', hoje),
       MidiaSugestao('2', false, 10, 'DCIM/Camera/', hoje),
     ], agora: hoje);
-    final w = g.firstWhere((e) => e.titulo == 'WhatsApp');
+    final w = g.firstWhere((e) => e.titulo == 'Fotos do WhatsApp');
     expect(w.ids, ['1']);
+  });
+
+  test('vídeos do WhatsApp têm grupo próprio', () {
+    final g = montarSugestoes([
+      MidiaSugestao('v', true, 10,
+          'Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Video/Sent/', hoje),
+      MidiaSugestao('f', false, 10,
+          'Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images/', hoje),
+    ], agora: hoje);
+    expect(g.firstWhere((e) => e.titulo == 'Vídeos do WhatsApp').ids, ['v']);
+    expect(g.firstWhere((e) => e.titulo == 'Fotos do WhatsApp').ids, ['f']);
   });
 
   test('screenshots e downloads', () {

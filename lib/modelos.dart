@@ -53,7 +53,12 @@ class ArquivoDrive {
   final int bytes;
   final String pasta;
   final String? md5; // md5Checksum que o Drive calculou (rodada 12)
-  ArquivoDrive(this.fileId, this.nome, this.bytes, this.pasta, {this.md5});
+  // Rodada 18: id da subpasta onde está (pra mover) e a data no Drive (pra
+  // corrigir backups antigos que ficaram com a data do upload).
+  final String? paiId;
+  final DateTime? modificado;
+  ArquivoDrive(this.fileId, this.nome, this.bytes, this.pasta,
+      {this.md5, this.paiId, this.modificado});
 }
 
 /// Metadados que viajam dentro da tarefa do background_downloader.

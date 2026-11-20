@@ -2,13 +2,73 @@
 
 ## ESTADO DA EXECUÇÃO (atualizado 2026-11-20) — LEIA PRIMEIRO
 
-Branch `rodadas-12-a-17` (a partir de `main` 85efe74). Versão 1.5.0+6.
-**COMPILADO E TESTADO NA NUVEM em 2026-11-20 (Flutter 3.50.1, Dart 3.14.0).**
-`flutter pub get`, `flutter analyze`, `flutter test` (44 testes) e
-`flutter build apk --debug` passaram. Ainda NÃO foi testado em aparelho:
-próximo passo é o Bruno instalar o APK e seguir a ordem de testes lá embaixo.
+Branch `rodadas-12-a-17` (a partir de `main` 85efe74). Versão 1.6.0+7.
+**Rodada 18 (2026-11-20) compilada e testada na nuvem** (Flutter 3.50.1):
+`flutter analyze` sem nenhum aviso, 62 testes, APK debug e release. Ainda NÃO
+foi testado em aparelho: nada das rodadas 12 a 18 rodou num celular.
 
-Correções feitas na compilação:
+Decisões do Bruno (2026-11-20): app de uso próprio, sem Play Store. Pode
+renomear pastas no Drive, ter lixeira, botão de corrigir datas e modo escuro.
+
+Feito na rodada 18:
+- A-06b pastas: `lib/pastas.dart`. Nome = último pedaço, com o pai na frente
+  quando o pai não é raiz (`WhatsApp Images › Sent`). DCIM/Camera continua
+  "Camera". Compatível: `pastaLegada` devolve o nome antigo e
+  `pastasPossiveis` é usado no reconhecimento (`_reconhecerNoDrive`), no
+  `acharNoDrive` (pasta antiga só se existir, sem criar) e no
+  `decidirApagar`. Ajustes > Organizar pastas no Drive move o que está na
+  pasta antiga (`BackupService.organizarPastas`, plano puro em
+  `lib/manutencao_drive.dart`). Arquivos já apagados do celular ficam na
+  pasta antiga (não dá pra saber a origem).
+- A-07 lixeira: Ajustes > Apagar pra lixeira do celular (só Android 11+,
+  canal nativo `sdk`). Apagar usa `PhotoManager.editor.android.moveToTrash`.
+- Corrigir datas: Ajustes > Corrigir datas no Drive
+  (`BackupService.corrigirDatas`): só `modifiedTime` (o Drive não deixa mudar
+  `createdTime`), 4 por vez, tolera 2 s, pula data inválida.
+- Modo escuro: cores viraram getters em `app_tema.dart` (`_escuro` acertado
+  no `MaterialApp.builder`), Ajustes > Aparência (automático/claro/escuro,
+  flag `tema_v1`). Cada `build` chama `_dependerDoTema(context)`.
+- A-32: `main.dart` de 4.097 pra ~380 linhas. Home em extensões
+  (`home_motor`, `home_galeria`, `home_drive`, `home_telas`; `setState` vira
+  `_set` nelas). Telas em `app_paginas`, grade em `app_midia`. As `static
+  const` do State viraram constantes de topo.
+- A-16: `lib/selecao.dart` guarda soma e contagem por pasta na hora
+  (total selecionado e estado da pasta ficaram O(1)).
+- A-26 arrasto: `_GradeMidias`. Com algo marcado, segurar e arrastar marca a
+  faixa; sem nada marcado, segurar abre a prévia (dica `dica_previa_v2`).
+- A-27: "deixe o app aberto na tomada" saiu da notificação e dos avisos;
+  ficou 1 dica no banner com "Entendi" (`dica_app_aberto_v1`) e o diálogo de
+  job grande (> 5 GB).
+- A-36: `lib/diario.dart`. 11 `catch (_) {}` do motor (fila, cancelar,
+  achar/apagar no Drive, salvar sessão) agora registram no `eventos.log`.
+- A-29: "Vídeos do WhatsApp" e "Fotos do WhatsApp" em grupos separados.
+  A soma da seleção já era a união (o aviso de sobreposição já existia).
+- Dependências: `material_ui` no lugar de `package:flutter/material.dart`;
+  photo_manager 3.9 → 3.12; `android.builtInKotlin=true` (o caminho antigo
+  quebrava a compilação do photo_manager 3.12).
+- A-34 minify: nada a fazer, o Flutter já liga R8 no release.
+
+Continua NÃO feito (e por quê):
+- F4 inteira (motor sem o app aberto, google_sign_in 7, notificação única
+  A-19/A-20): depende do teste de 1 noite com Transferência longa.
+- A-08 teto de MD5 e A-15 galeria pela consulta nativa: precisam de medição
+  em aparelho antes.
+- A-35 publicar consentimento OAuth: é no Google Cloud, com o Bruno.
+- Sugestão "Duplicatas exatas": fica de fora. Duplicata exata já sobe 1 vez
+  só (MD5), e apagar cópia sem backup não é o papel do app.
+- O aviso de KGP do photo_manager continua: o build.gradle dele ainda carrega
+  o Kotlin antigo. Só uma versão nova do plugin tira.
+
+Ordem de teste no aparelho (rodada 18 primeiro, depois a lista antiga):
+1. Abrir, ver a aba Pastas: WhatsApp aparece separado por "Images › Sent" e
+   "Video › Sent". Backups antigos continuam com nuvem nos itens.
+2. Ajustes > Organizar pastas no Drive, conferir no Drive que o "Sent" foi
+   esvaziado do que ainda está no celular.
+3. Ajustes > Corrigir datas, conferir a data de um arquivo antigo no Drive.
+4. Ligar lixeira, apagar 2 fotos, ver na lixeira da galeria e restaurar 1.
+5. Aparência escura e automática; arrastar pra marcar.
+
+Rodada 17, correções feitas na compilação:
 - `android/`: Gradle 9.1.0 → 9.5.0, AGP 9.0.1 → 9.3.1, Kotlin 2.3.20 → 2.4.20.
   O Flutter 3.50 recusa Gradle < 9.3.1, AGP < 9.1.1 e KGP < 2.4.10.
 - `upload_retomavel.dart`: `return await` nos retornos de `_fimOk`/`_invalida`

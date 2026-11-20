@@ -1,4 +1,5 @@
 import 'modelos.dart';
+import 'pastas.dart';
 
 /// Decisão de "pode apagar do celular?" por arquivo. Pura e testada
 /// (test/verificacao_apagar_test.dart): é a regra que protege contra perda.
@@ -39,7 +40,8 @@ bool precisaMd5(CandidatoApagar c, int tetoMd5) =>
 
 /// Regras:
 /// 1. Achar o arquivo no Drive: pelo fileId gravado; sem fileId, por
-///    nome+pasta+tamanho (cada arquivo do Drive cobre UM do celular).
+///    nome+pasta+tamanho (cada arquivo do Drive cobre UM do celular). A
+///    pasta pode ser a nova ou a de antes da rodada 18 (pastaLegada).
 /// 2. Tamanho do Drive = tamanho no celular agora = tamanho enviado.
 /// 3. Integridade: já verificado no upload, OU acima do teto de MD5 (vale o
 ///    tamanho, como sempre foi), OU MD5 local igual ao MD5 do Drive.
@@ -62,8 +64,10 @@ ResultadoApagar decidirApagar(
     if (c.fileId != null) {
       a = porId[c.fileId];
     } else if (c.bytesAgora > 0) {
-      final lista = porChave['${c.titulo}|${c.pasta}|${c.bytesAgora}'];
-      if (lista != null) {
+      // Rodada 18: procura na pasta nova e na de antes da mudança de nome.
+      for (final p in pastasPossiveis(c.pasta)) {
+        final lista = porChave['${c.titulo}|$p|${c.bytesAgora}'];
+        if (lista == null) continue;
         for (final x in lista) {
           if (!usados.contains(x.fileId)) {
             a = x;
@@ -71,6 +75,7 @@ ResultadoApagar decidirApagar(
             break;
           }
         }
+        if (a != null) break;
       }
     }
     if (a == null) {

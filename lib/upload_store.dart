@@ -446,9 +446,22 @@ class UploadStore {
 
   // Flags genéricas (rodada 13+).
   static const kMotorNovo = 'motor_nativo_v1'; // F4: desligado por padrão
-  static const kDicaPrevia = 'dica_previa_v1';
+  static const kDicaPrevia = 'dica_previa_v2'; // v2: arrasto (rodada 18)
   static const kTransferenciaLonga = 'uidt_v1'; // F3: UIDT, desligado por padrão
   static const kTotalLiberado = 'total_liberado_bytes';
+  static const kLixeira = 'apagar_pra_lixeira_v1'; // rodada 18
+  static const kDicaAberto = 'dica_app_aberto_v1'; // rodada 18
+  static const kTema = 'tema_v1'; // 'sistema' | 'claro' | 'escuro'
+
+  Future<String?> texto(String chave) async {
+    final p = await SharedPreferences.getInstance();
+    return p.getString(chave);
+  }
+
+  Future<void> setTexto(String chave, String v) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setString(chave, v);
+  }
 
   Future<bool> flag(String chave) async {
     final p = await SharedPreferences.getInstance();

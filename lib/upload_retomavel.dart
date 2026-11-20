@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
+import 'diario.dart';
 
 /// Upload retomável DE VERDADE (rodada 15, motor novo experimental).
 ///
@@ -110,7 +111,9 @@ class UploadRetomavel {
         final tmp = File('${_arquivo.path}.tmp');
         await tmp.writeAsString(jsonEncode(copia), flush: true);
         await tmp.rename(_arquivo.path);
-      } catch (_) {}
+      } catch (e) {
+        falhaEngolida('salvar sessões retomáveis', e);
+      }
     });
     return _gravando;
   }

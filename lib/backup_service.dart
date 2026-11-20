@@ -9,6 +9,9 @@ import 'package:googleapis/drive/v3.dart' as drive;
 import 'package:http/http.dart' as http;
 import 'package:photo_manager/photo_manager.dart';
 import 'modelos.dart';
+import 'manutencao_drive.dart';
+import 'pastas.dart';
+import 'diario.dart';
 
 export 'modelos.dart';
 
@@ -67,7 +70,7 @@ class BackupService {
     FileDownloader().configureNotificationForGroup(
       grupo,
       running: const TaskNotification(
-          'Limpa Memória', 'Fazendo backup… deixe o app aberto na tomada'),
+          'Limpa Memória', 'Fazendo backup…'),
       complete: const TaskNotification(
           'Limpa Memória', 'Fila do Android concluída. Abra o app pra continuar'),
       error: const TaskNotification(
@@ -80,7 +83,9 @@ class BackupService {
     try {
       await FileDownloader()
           .configure(globalConfig: (Config.runInForeground, Config.always));
-    } catch (_) {}
+    } catch (e) {
+      falhaEngolida('configurar primeiro plano', e);
+    }
     try {
       await FileDownloader().permissions.request(PermissionType.notifications);
     } catch (_) {}
@@ -98,7 +103,9 @@ class BackupService {
   static Future<void> limparFilaLegada() async {
     try {
       await FileDownloader().reset(group: grupo);
-    } catch (_) {}
+    } catch (e) {
+      falhaEngolida('limparFilaLegada', e);
+    }
   }
 
   /// Cancela tudo que está na fila do Android (botão Parar). As sessões no
@@ -109,14 +116,18 @@ class BackupService {
       if (ids.isNotEmpty) {
         await FileDownloader().cancelTasksWithIds(ids);
       }
-    } catch (_) {}
+    } catch (e) {
+      falhaEngolida('cancelarTudo', e);
+    }
   }
 
   /// Cancela tarefas específicas (Parar chegou no meio de uma leva).
   static Future<void> cancelar(Iterable<String> ids) async {
     try {
       await FileDownloader().cancelTasksWithIds(ids);
-    } catch (_) {}
+    } catch (e) {
+      falhaEngolida('cancelar', e);
+    }
   }
 
   /// Fonte da verdade do que já subiu: tudo que o banco da biblioteca marca
@@ -140,7 +151,9 @@ class BackupService {
     if (ids.isEmpty) return;
     try {
       await FileDownloader().database.deleteRecordsWithIds(ids);
-    } catch (_) {}
+    } catch (e) {
+      falhaEngolida('limpar registros', e);
+    }
   }
 
   /// Ids que já estão na fila de upload (rodando, esperando ou pra retentar).
@@ -464,6 +477,104 @@ class BackupService {
     }
   }
 
+  /// Id da subpasta SE ela já existe (não cria). Rodada 18: procurar na pasta
+  /// de nome antigo sem criar pasta vazia no Drive.
+  static Future<String?> _subpastaExistente(
+      GoogleSignIn gsi, String nome) async {
+    final pronto = _subCache[nome];
+    if (pronto != null) return pronto;
+    if (_mainId == null) await prepararContexto(gsi);
+    final main = _mainId;
+    if (main == null) return null;
+    final achadas =
+        await _naApiComGsi(gsi, (api) => _acharPastas(api, nome, main));
+    if (achadas.isEmpty) return null;
+    _subCache[nome] = achadas.first;
+    return achadas.first;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Manutenção do que já subiu (rodada 18)
+  // ---------------------------------------------------------------------------
+
+  /// Move pra pasta de nome novo o que subiu na pasta de nome antigo
+  /// ("Sent" -> "WhatsApp Images › Sent"). Só mexe em pasta (o arquivo, o
+  /// fileId e o conteúdo continuam iguais). Devolve (movidos, falhas) ou null
+  /// se não conseguiu listar o Drive.
+  static Future<(int, int)?> organizarPastas(
+      GoogleSignIn gsi, List<ItemEnviado> itens,
+      {void Function(int feitos, int total)? progresso,
+      bool Function()? cancelado}) async {
+    final mudam =
+        itens.where((e) => pastaLegada(e.item.pasta) != e.item.pasta).toList();
+    if (mudam.isEmpty) return (0, 0);
+    invalidarListagem();
+    final noDrive = await listarNoDrive(gsi, pastas: {
+      for (final e in mudam) ...pastasPossiveis(e.item.pasta),
+    });
+    if (noDrive == null) return null;
+    final plano = planejarMovimentos(mudam, noDrive);
+    var movidos = 0, falhas = 0, feitos = 0;
+    progresso?.call(0, plano.length);
+    for (final m in plano) {
+      if (cancelado?.call() ?? false) break;
+      try {
+        final para = await _subpasta(gsi, m.paraPasta);
+        await _naApi(
+            gsi,
+            (api) => api.files.update(drive.File(), m.fileId,
+                addParents: para, removeParents: m.de, $fields: 'id'));
+        movidos++;
+      } catch (_) {
+        falhas++;
+      }
+      progresso?.call(++feitos, plano.length);
+    }
+    invalidarListagem();
+    return (movidos, falhas);
+  }
+
+  /// Troca a data dos arquivos no Drive pela data da mídia (backups de antes
+  /// da rodada 12 ficaram com a data do upload). Só o "modificado": o Drive
+  /// não deixa mudar a data de criação depois que o arquivo existe.
+  /// Devolve (corrigidos, falhas, jaCertos) ou null se não listou o Drive.
+  static Future<(int, int, int)?> corrigirDatas(
+      GoogleSignIn gsi, List<ItemEnviado> itens,
+      {void Function(int feitos, int total)? progresso,
+      bool Function()? cancelado}) async {
+    if (itens.isEmpty) return (0, 0, 0);
+    invalidarListagem();
+    final noDrive = await listarNoDrive(gsi, pastas: {
+      for (final e in itens) ...pastasPossiveis(e.item.pasta),
+    });
+    if (noDrive == null) return null;
+    final plano = planejarDatas(itens, noDrive);
+    var ok = 0, falhas = 0, feitos = 0, i = 0;
+    progresso?.call(0, plano.length);
+    Future<void> trabalhador() async {
+      while (i < plano.length && !(cancelado?.call() ?? false)) {
+        final c = plano[i++];
+        try {
+          await _naApi(
+              gsi,
+              (api) => api.files.update(
+                  drive.File()..modifiedTime = c.data, c.fileId,
+                  $fields: 'id'));
+          ok++;
+        } catch (_) {
+          falhas++;
+        }
+        progresso?.call(++feitos, plano.length);
+      }
+    }
+
+    // 4 por vez: rápido sem esbarrar no limite de escrita do Drive (o _naApi
+    // já espera e tenta de novo em 403/429 de taxa).
+    await Future.wait([for (var k = 0; k < 4; k++) trabalhador()]);
+    invalidarListagem();
+    return (ok, falhas, itens.length - plano.length);
+  }
+
   /// Pré-cria/encontra todas as subpastas de uma leva ANTES de enfileirar em
   /// paralelo.
   static Future<void> garantirSubpastas(
@@ -564,7 +675,8 @@ class BackupService {
               gsi,
               (api) => api.files.list(
                     q: "'$paiId' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false",
-                    $fields: 'nextPageToken, files(id,name,size,md5Checksum)',
+                    $fields:
+                        'nextPageToken, files(id,name,size,md5Checksum,modifiedTime)',
                     pageSize: 1000,
                     pageToken: pt,
                   ),
@@ -577,6 +689,8 @@ class BackupService {
               int.tryParse(f.size ?? '') ?? 0,
               paiNome,
               md5: f.md5Checksum,
+              paiId: paiId,
+              modificado: f.modifiedTime,
             ));
           }
           pageToken = res.nextPageToken;
@@ -600,21 +714,30 @@ class BackupService {
     try {
       final (ok, _) = await garantirContexto(gsi);
       if (!ok) return null;
-      final sub = await _subpasta(gsi, item.pasta);
-      final res = await _naApi(
-          gsi,
-          (api) => api.files.list(
-                q: "name='${_esc(item.titulo)}' and '$sub' in parents and trashed=false",
-                $fields: 'files(id,size,md5Checksum)',
-                pageSize: 10,
-              ),
-          tentativas: 2);
-      for (final f in res.files ?? const <drive.File>[]) {
-        if (f.id != null && int.tryParse(f.size ?? '') == item.bytes) {
-          return (f.id!, f.md5Checksum);
+      // Rodada 18: a pasta nova e a de antes da mudança de nome. A antiga só
+      // é procurada se já existir (não cria pasta vazia à toa).
+      for (final nome in pastasPossiveis(item.pasta)) {
+        final sub = nome == item.pasta
+            ? await _subpasta(gsi, nome)
+            : await _subpastaExistente(gsi, nome);
+        if (sub == null) continue;
+        final res = await _naApi(
+            gsi,
+            (api) => api.files.list(
+                  q: "name='${_esc(item.titulo)}' and '$sub' in parents and trashed=false",
+                  $fields: 'files(id,size,md5Checksum)',
+                  pageSize: 10,
+                ),
+            tentativas: 2);
+        for (final f in res.files ?? const <drive.File>[]) {
+          if (f.id != null && int.tryParse(f.size ?? '') == item.bytes) {
+            return (f.id!, f.md5Checksum);
+          }
         }
       }
-    } catch (_) {}
+    } catch (e) {
+      falhaEngolida('acharNoDrive', e);
+    }
     return null;
   }
 
@@ -624,7 +747,9 @@ class BackupService {
     try {
       await _naApi(gsi, (api) => api.files.delete(fileId));
       invalidarListagem();
-    } catch (_) {}
+    } catch (e) {
+      falhaEngolida('apagarNoDrive', e);
+    }
   }
 
   // ---------------------------------------------------------------------------

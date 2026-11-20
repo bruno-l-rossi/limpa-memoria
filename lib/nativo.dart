@@ -106,6 +106,15 @@ class Nativo {
   }
 
   /// Share sheet do Android com um texto.
+  /// Versão do Android (API). 0 se não deu pra saber.
+  static Future<int> sdk() async {
+    try {
+      return await _canal.invokeMethod<int>('sdk') ?? 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
   static Future<void> compartilhar(String texto) async {
     try {
       await _canal.invokeMethod('compartilhar', {'texto': texto});
