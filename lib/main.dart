@@ -7,7 +7,6 @@ import 'package:flutter/material.dart';
 import 'package:photo_manager/photo_manager.dart';
 import 'package:video_player/video_player.dart';
 import 'package:google_sign_in/google_sign_in.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:background_downloader/background_downloader.dart';
 import 'upload_store.dart';
 import 'backup_service.dart';
@@ -34,11 +33,11 @@ ThemeData _tema() {
     primary: _actionBlue,
     brightness: Brightness.light,
   );
-  final base = ThemeData(useMaterial3: true, colorScheme: scheme);
+  final base =
+      ThemeData(useMaterial3: true, colorScheme: scheme, fontFamily: 'Inter');
   return base.copyWith(
     scaffoldBackgroundColor: _canvas,
-    textTheme: GoogleFonts.interTextTheme(base.textTheme)
-        .apply(bodyColor: _ink, displayColor: _ink),
+    textTheme: base.textTheme.apply(bodyColor: _ink, displayColor: _ink),
     appBarTheme: AppBarTheme(
       backgroundColor: _canvas,
       foregroundColor: _ink,
@@ -46,7 +45,8 @@ ThemeData _tema() {
       scrolledUnderElevation: 0,
       surfaceTintColor: Colors.transparent,
       centerTitle: false,
-      titleTextStyle: GoogleFonts.inter(
+      titleTextStyle: const TextStyle(
+          fontFamily: 'Inter',
           color: _ink,
           fontSize: 20,
           fontWeight: FontWeight.w600,
@@ -58,7 +58,8 @@ ThemeData _tema() {
         foregroundColor: Colors.white,
         shape: const StadiumBorder(),
         padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 14),
-        textStyle: GoogleFonts.inter(fontSize: 16, fontWeight: FontWeight.w400),
+        textStyle: const TextStyle(
+            fontFamily: 'Inter', fontSize: 16, fontWeight: FontWeight.w400),
       ),
     ),
   );
@@ -144,10 +145,11 @@ class _ThumbCache {
     _mapa[id] = bytes;
   }
 
-  static Future<Uint8List?> carregar(AssetEntity asset, PMCancelToken token) {
+  static Future<Uint8List?> carregar(
+      AssetEntity asset, PMCancelToken token, int lado) {
     final id = asset.id;
     return asset
-        .thumbnailDataWithSize(const ThumbnailSize(200, 200),
+        .thumbnailDataWithSize(ThumbnailSize(lado, lado),
             quality: 80, cancelToken: token)
         .then((b) {
       if (b != null) guardar(id, b);
@@ -220,6 +222,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _pausado = false; // backup pausado (pelo usuário ou por Drive cheio)
   bool _driveCheio = false; // pausa automática por cota estourada
   bool _soWifi = false; // subir só no wifi (escolha do usuário)
+  bool _motorNovo = false; // F4: motor nativo retomável (experimental)
   StreamSubscription<TaskUpdate>? _sub;
 
   // Janela deslizante guiada pelo banco da biblioteca (a fonte da verdade).
@@ -799,6 +802,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 'Acabei de guardar $arquivos fotos e vídeos (${_fmt(bytes)}) na nuvem e liberar espaço no celular com o Limpa Memória.'),
             child: const Text('Compartilhar'),
           ),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: Text(liberaveis > 0 ? 'Depois' : 'Fechar')),
           if (liberaveis > 0)
             FilledButton(
               onPressed: () {
@@ -806,11 +812,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 _apagarEnviados();
               },
               child: Text('Liberar ${_fmt(liberaveis)}'),
-            )
-          else
-            TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text('Fechar')),
+            ),
         ],
       ),
     );
@@ -1354,36 +1356,61 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // Ações do usuário
   // ---------------------------------------------------------------------------
 
-  Widget _barraAcoes() {
+  Widget _barraAcoes({bool pastas = false}) {
     return Padding(
-      padding: const EdgeInsets.only(right: 20),
+      padding: const EdgeInsets.only(right: 12),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
           TextButton.icon(
-              onPressed: _selecionarTudo,
+              onPressed: pastas
+                  ? () => setState(() => _selected.addAll(_items))
+                  : _selecionarTudo,
               icon: const Icon(Icons.done_all),
-              label: const Text('Selecionar tudo')),
+              label: Text(pastas || (_filtro == 'todos' && _tipo == 'todos')
+                  ? 'Selecionar tudo'
+                  : 'Selecionar estes')),
           TextButton(
               onPressed: _selected.isEmpty ? null : _limparSelecao,
-              child: const Text('Limpar seleção')),
+              child: const Text('Limpar')),
           const Spacer(),
           PopupMenuButton<String>(
-            icon: const Icon(Icons.sort),
-            tooltip: 'Ordenar',
+            icon: Icon(Icons.tune,
+                color: (!pastas && _tipo != 'todos') ? _actionBlue : null),
+            tooltip: 'Ordenar e filtrar',
             onSelected: (v) => setState(() {
-              _ordem = v;
-              _ordenadoCache = null;
+              if (v.startsWith('tipo:')) {
+                _tipo = v.substring(5);
+                _filtradoCache = null;
+              } else {
+                _ordem = v;
+                _ordenadoCache = null;
+              }
             }),
             itemBuilder: (_) => [
               CheckedPopupMenuItem(
                   value: 'tamanho',
                   checked: _ordem == 'tamanho',
-                  child: const Text('Por tamanho')),
+                  child: const Text('Maiores primeiro')),
               CheckedPopupMenuItem(
                   value: 'data',
                   checked: _ordem == 'data',
-                  child: const Text('Por data')),
+                  child: const Text('Mais recentes primeiro')),
+              if (!pastas) ...[
+                const PopupMenuDivider(),
+                CheckedPopupMenuItem(
+                    value: 'tipo:todos',
+                    checked: _tipo == 'todos',
+                    child: const Text('Fotos e vídeos')),
+                CheckedPopupMenuItem(
+                    value: 'tipo:fotos',
+                    checked: _tipo == 'fotos',
+                    child: const Text('Só fotos')),
+                CheckedPopupMenuItem(
+                    value: 'tipo:videos',
+                    checked: _tipo == 'videos',
+                    child: const Text('Só vídeos')),
+              ],
             ],
           ),
         ],
@@ -1402,14 +1429,33 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         _tick(); // retoma backup pendente, se houver
       }
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('Falha no login: $e')));
-      }
+      _ev('Falha no login: $e');
+      _avisar(mensagemAmigavel(e));
     }
   }
 
+  /// Sair pede confirmação: antes um toque no ícone da conta deslogava na
+  /// hora, inclusive no meio de um backup.
   Future<void> _logout() async {
+    final subindo = _emFila.isNotEmpty && _bgFeitos < _bgTotal && !_pausado;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Sair da conta Google?'),
+        content: Text(subindo
+            ? 'Tem um backup em andamento. Saindo, ele para até você entrar de novo. Nada do que já subiu se perde.'
+            : 'O que já está no Drive continua lá. Pra subir ou apagar de novo, é só entrar outra vez.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancelar')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Sair')),
+        ],
+      ),
+    );
+    if (ok != true) return;
     await _gsi.signOut();
     if (!mounted) return;
     setState(() => _conta = null);
@@ -1451,17 +1497,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ],
       ),
     );
-  }
-
-  Future<void> _alternarWifi() async {
-    final novo = !_soWifi;
-    await _store.setSoWifi(novo);
-    if (!mounted) return;
-    setState(() => _soWifi = novo);
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(novo
-            ? 'Só no wifi: os próximos arquivos esperam uma rede wifi.'
-            : 'Qualquer rede: sobe no wifi e em dados móveis.')));
   }
 
   Future<void> _prepararJobGrande(int precisa) async {
@@ -1569,9 +1604,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Future<void> _subir() async {
     if (_subindoAgora) return;
     if (_conta == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Entre com o Google primeiro.')));
-      return;
+      await _login(); // abre o login aqui mesmo e segue
+      if (_conta == null || !mounted) return;
     }
     _subindoAgora = true;
     try {
@@ -1585,13 +1619,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final (ok, erroCtx) = await BackupService.prepararContexto(_gsi);
     if (!ok) {
       if (!mounted) return;
+      _ev('Não começou: $erroCtx');
       showDialog(
         context: context,
         builder: (ctx) => AlertDialog(
           title: const Text('Não consegui começar o backup'),
           content: Text(BackupService.ehRede(erroCtx)
               ? 'Sem conexão com o Google agora. Confira a internet e tente de novo.'
-              : (erroCtx ?? 'Falha ao preparar o Drive.')),
+              : mensagemAmigavel(erroCtx)),
           actions: [
             TextButton(
                 onPressed: () => Navigator.pop(ctx), child: const Text('OK')),
@@ -1852,10 +1887,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return;
     }
     if (_conta == null) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text(
-              'Entre com o Google: sem conferir no Drive, nada é apagado.')));
-      return;
+      await _login(); // sem conferir no Drive, nada é apagado
+      if (_conta == null || !mounted) return;
     }
 
     final bytes = candidatos.fold<int>(0, (s, id) => s + itemPorId[id]!.bytes);
@@ -2057,14 +2090,42 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     });
     final restam = verificados.length - setApagados.length;
     _ev('Apagar: ${setApagados.length} apagados, $naoConferidos não conferiram, ${recusou ? 'usuário recusou um lote' : 'sem recusa'}');
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text([
-      'Apagados ${_milhar(setApagados.length)} do celular.',
+    final liberados = setApagados.fold<int>(
+        0, (soma, id) => soma + (itemPorId[id]?.bytes ?? 0));
+    final extras = [
       if (recusou && restam > 0)
-        '${_milhar(restam)} ficaram (confirmação recusada).',
+        '${_milhar(restam)} ficaram porque a confirmação do Android foi recusada.',
       if (naoConferidos > 0)
-        '${_milhar(naoConferidos)} não conferiram no Drive e ficaram no celular.',
-    ].join(' '))));
+        '${_milhar(naoConferidos)} não conferiram no Drive e ficaram no celular, por segurança.',
+    ];
+    if (setApagados.isEmpty) {
+      _avisar(['Nada foi apagado.', ...extras].join(' '));
+      return;
+    }
+    // Fecha o ciclo com o ganho que o app promete: espaço livre.
+    final total = await _store.somarLiberado(liberados);
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.celebration_outlined, color: _actionBlue),
+        title: Text('Você liberou ${_fmt(liberados)}'),
+        content: Text([
+          '${_milhar(setApagados.length)} arquivos saíram do celular e continuam no seu Drive.',
+          if (total > liberados) 'No total o app já liberou ${_fmt(total)}.',
+          ...extras,
+        ].join('\n\n')),
+        actions: [
+          TextButton(
+            onPressed: () => Nativo.compartilhar(
+                'Liberei ${_fmt(liberados)} do celular sem perder nenhuma foto, com o Limpa Memória.'),
+            child: const Text('Compartilhar'),
+          ),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('Ok')),
+        ],
+      ),
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -2170,10 +2231,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final job = await _store.job();
     final pausado = await _store.pausado();
     final soWifi = await _store.soWifi();
+    final motorNovo = await _store.flag(UploadStore.kMotorNovo);
     if (!mounted) return;
     setState(() {
       _pausado = pausado;
       _soWifi = soWifi;
+      _motorNovo = motorNovo;
       if (job.isNotEmpty) {
         _carregarSessao(job.map(ItemBackup.fromMap).toList());
         _inicioSessao ??= DateTime.now();
@@ -2453,10 +2516,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (!ps.isAuth && !ps.hasAccess) {
       setState(() {
         _loading = false;
-        _status = 'Permissão negada. Libere o acesso a fotos e tente de novo.';
+        _permissaoNegada = true;
       });
       return;
     }
+    if (_permissaoNegada) setState(() => _permissaoNegada = false);
     _acessoTotal = ps.isAuth;
     _acessoParcial = !ps.isAuth && ps.hasAccess;
     final paths = await PhotoManager.getAssetPathList(
@@ -2615,14 +2679,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   List<MediaItem> get _itensFiltrados {
     final base = _itensOrdenados;
-    if (_filtro == 'todos') return base;
-    final chave = '$_filtro|$_rev|$_ordenadoChave';
+    if (_filtro == 'todos' && _tipo == 'todos') return base;
+    final chave = '$_filtro|$_tipo|$_rev|$_ordenadoChave';
     if (_filtradoCache != null && _filtradoChave == chave) {
       return _filtradoCache!;
     }
     final noDrive = _filtro == 'drive';
     final lista = base
-        .where((m) => _enviadosIds.contains(m.id) == noDrive)
+        .where((m) =>
+            (_filtro == 'todos' || _enviadosIds.contains(m.id) == noDrive) &&
+            (_tipo == 'todos' || m.video == (_tipo == 'videos')))
         .toList(growable: false);
     _filtradoCache = lista;
     _filtradoChave = chave;
@@ -2642,9 +2708,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         }
       });
 
-  void _selecionarTudo() => setState(() => _selected.addAll(_items));
+  /// Seleciona o que está VISÍVEL (respeita os filtros). Antes, com "Fora do
+  /// Drive" ativo, marcava também o que já estava no Drive.
+  void _selecionarTudo() => setState(() => _selected.addAll(_itensFiltrados));
   void _limparSelecao() => setState(() => _selected.clear());
-  bool _pastaToda(Pasta p) => p.itens.every(_selected.contains);
+  /// true = toda selecionada, false = nada, null = parte.
+  bool? _estadoPasta(Pasta p) {
+    var n = 0;
+    for (final i in p.itens) {
+      if (_selected.contains(i)) n++;
+    }
+    if (n == 0) return false;
+    return n == p.itens.length ? true : null;
+  }
 
   void _togglePasta(Pasta p, bool? v) => setState(() {
         if (v == true) {
@@ -2724,53 +2800,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             tabs: [Tab(text: 'Mídias'), Tab(text: 'Pastas')],
           ),
           actions: [
+            _botaoConta(),
             IconButton(
-              icon: Icon(_conta == null
-                  ? Icons.account_circle_outlined
-                  : Icons.account_circle),
-              tooltip: _conta?.email ?? 'Entrar com Google',
-              onPressed: _conta == null ? _login : _logout,
-            ),
-            IconButton(
-              icon: Icon(_soWifi ? Icons.wifi : Icons.wifi_tethering),
-              tooltip: _soWifi
-                  ? 'Subindo só no wifi (toque pra liberar dados móveis)'
-                  : 'Subindo em qualquer rede (toque pra exigir wifi)',
-              onPressed: _alternarWifi,
-            ),
-            IconButton(
-              icon: const Icon(Icons.delete_outline),
-              tooltip: 'Apagar do celular (confere no Drive antes)',
-              onPressed: _enviadosIds.isEmpty ? null : _apagarEnviados,
-            ),
-            PopupMenuButton<String>(
-              tooltip: 'Mais',
-              onSelected: (v) {
-                switch (v) {
-                  case 'espaco':
-                    _checarEspaco();
-                  case 'recarregar':
-                    _recarregarGaleria();
-                  case 'diagnostico':
-                    _abrirDiagnostico();
-                }
-              },
-              itemBuilder: (_) => [
-                PopupMenuItem(
-                    value: 'espaco',
-                    enabled: _conta != null,
-                    child: const Text('Espaço no Drive')),
-                const PopupMenuItem(
-                    value: 'recarregar', child: Text('Recarregar galeria')),
-                const PopupMenuItem(
-                    value: 'diagnostico', child: Text('Diagnóstico')),
-              ],
+              icon: const Icon(Icons.settings_outlined),
+              tooltip: 'Ajustes',
+              onPressed: _abrirAjustes,
             ),
           ],
         ),
-        body: _loading || _items.isEmpty
-            ? Center(child: Text(_status))
-            : Column(
+        body: _permissaoNegada
+            ? _telaPermissao()
+            : _loading
+                ? _telaCarregando()
+                : _items.isEmpty
+                    ? _telaVazia()
+                    : Column(
                 children: [
                   if (_calculando) ...[
                     const SizedBox(height: 12),
@@ -2801,32 +2845,197 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   ),
                 ],
               ),
-        bottomNavigationBar: _items.isEmpty
-            ? null
-            : Container(
-                decoration: const BoxDecoration(
-                  color: _parchment,
-                  border: Border(top: BorderSide(color: _hairline)),
+        bottomNavigationBar: _items.isEmpty ? null : _barraSubir(),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Conta, ajustes e estados de tela (rodada 13)
+  // ---------------------------------------------------------------------------
+
+  Widget _botaoConta() {
+    if (_conta == null) {
+      return TextButton(onPressed: _login, child: const Text('Entrar'));
+    }
+    return PopupMenuButton<String>(
+      tooltip: _conta!.email,
+      icon: const Icon(Icons.account_circle),
+      onSelected: (v) {
+        switch (v) {
+          case 'espaco':
+            _checarEspaco();
+          case 'sair':
+            _logout();
+        }
+      },
+      itemBuilder: (_) => [
+        PopupMenuItem(
+          enabled: false,
+          child: Text(_conta!.email,
+              style: const TextStyle(color: _inkMuted, fontSize: 13)),
+        ),
+        const PopupMenuItem(value: 'espaco', child: Text('Espaço no Drive')),
+        const PopupMenuItem(value: 'sair', child: Text('Sair da conta')),
+      ],
+    );
+  }
+
+  Future<void> _abrirAjustes() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => AjustesPage(
+          soWifi: _soWifi,
+          onSoWifi: (v) async {
+            await _store.setSoWifi(v);
+            if (mounted) setState(() => _soWifi = v);
+          },
+          onEspaco: _conta == null ? null : _checarEspaco,
+          onRecarregar: _recarregarGaleria,
+          onDiagnostico: _abrirDiagnostico,
+          onHistorico: _abrirHistorico,
+          motorNovo: _motorNovo,
+          onMotorNovo: (v) async {
+            await _store.setFlag(UploadStore.kMotorNovo, v);
+            if (mounted) setState(() => _motorNovo = v);
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _telaPermissao() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.photo_library_outlined,
+                size: 56, color: _actionBlue),
+            const SizedBox(height: 16),
+            const Text('O app precisa ver suas fotos e vídeos',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
+            const SizedBox(height: 8),
+            const Text(
+                'Sem esse acesso não dá pra listar nem guardar nada. Libere em Ajustes > Permissões > Fotos e vídeos > Permitir tudo.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: _inkMuted)),
+            const SizedBox(height: 20),
+            FilledButton(
+                onPressed: () => PhotoManager.openSetting(),
+                child: const Text('Abrir ajustes')),
+            TextButton(
+                onPressed: () {
+                  setState(() {
+                    _permissaoNegada = false;
+                    _loading = true;
+                  });
+                  _load();
+                },
+                child: const Text('Já liberei, tentar de novo')),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Esqueleto da grade enquanto a galeria carrega (antes: texto solto).
+  Widget _telaCarregando() {
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.all(16),
+          child: Text(_status, style: const TextStyle(color: _inkMuted)),
+        ),
+        Expanded(
+          child: GridView.builder(
+            physics: const NeverScrollableScrollPhysics(),
+            padding: const EdgeInsets.all(4),
+            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 3, mainAxisSpacing: 4, crossAxisSpacing: 4),
+            itemCount: 18,
+            itemBuilder: (_, __) => Container(color: _parchment),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _telaVazia() {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(_status, style: const TextStyle(color: _inkMuted)),
+          TextButton(
+              onPressed: _recarregarGaleria,
+              child: const Text('Recarregar')),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _abrirHistorico() async {
+    final sessoes = await _store.ultimasSessoes();
+    if (!mounted) return;
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => HistoricoPage(sessoes: sessoes)),
+    );
+  }
+
+  /// Lista dos arquivos que não subiram, com o motivo de cada um.
+  Future<void> _mostrarFalhas() async {
+    final itens = _falhos.values.toList();
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => SafeArea(
+        child: SizedBox(
+          height: MediaQuery.of(ctx).size.height * 0.6,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+                child: Text('${_milhar(itens.length)} arquivos não subiram',
+                    style: const TextStyle(
+                        fontSize: 18, fontWeight: FontWeight.w600)),
+              ),
+              Expanded(
+                child: ListView.builder(
+                  itemCount: itens.length,
+                  itemBuilder: (_, i) {
+                    final it = itens[i];
+                    return ListTile(
+                      dense: true,
+                      title: Text(it.titulo),
+                      subtitle: Text(
+                          '${it.pasta} · ${_fmt(it.bytes)}\n${_motivoFalha[it.id] ?? 'Motivo desconhecido'}'),
+                      isThreeLine: true,
+                    );
+                  },
                 ),
-                child: SafeArea(
-                  child: Padding(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                    child: Row(
-                      children: [
-                        Expanded(
-                            child: Text(
-                                '${_milhar(_selected.length)} selecionados • ${_fmt(_totalSelecionado)}')),
-                        FilledButton(
-                            onPressed: _selected.isEmpty || _subindoAgora
-                                ? null
-                                : _subir,
-                            child: const Text('Subir')),
-                      ],
-                    ),
+              ),
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      _tentarFalhosDeNovo();
+                    },
+                    child: const Text('Tentar todos de novo'),
                   ),
                 ),
               ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -2938,11 +3147,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               child: Text(detalhe,
                   style: const TextStyle(fontSize: 12, color: _inkMuted)),
             ),
-          if (!pronto && !_pausado && !fimFalhas && _conta != null)
+          if (!pronto && !_pausado && !fimFalhas && _conta != null && !_motorNovo)
             const Padding(
               padding: EdgeInsets.only(top: 2),
-              child: Text(
-                  'Com o app fechado sobem só os que já estão na fila do Android. Pra ir até o fim, deixe aberto na tomada.',
+              child: Text('Deixe o app aberto e na tomada até terminar.',
                   style: TextStyle(fontSize: 12, color: _inkMuted)),
             ),
           if (_falhos.isNotEmpty || _erroBg != null)
@@ -2953,17 +3161,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   Expanded(
                     child: Text(
                       _erroBg != null
-                          ? 'Problema: $_erroBg'
-                          : '${_milhar(_falhos.length)} arquivo(s) falharam.',
+                          ? mensagemAmigavel(_erroBg)
+                          : '${_milhar(_falhos.length)} arquivo(s) não subiram.',
                       style:
                           const TextStyle(fontSize: 12, color: Color(0xFFB00020)),
                     ),
                   ),
                   if (_falhos.isNotEmpty && !_driveCheio)
                     TextButton(
-                        onPressed: _tentarFalhosDeNovo,
-                        child:
-                            Text('Tentar de novo (${_milhar(_falhos.length)})')),
+                        onPressed: _mostrarFalhas,
+                        child: Text('Ver ${_milhar(_falhos.length)}')),
                 ],
               ),
             ),
@@ -3003,44 +3210,137 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   child: Text(
                       _filtro == 'drive'
                           ? 'Nada no Drive ainda.'
-                          : 'Nada fora do Drive.',
+                          : (_filtro == 'foradrive'
+                              ? 'Tudo já está no Drive.'
+                              : 'Nada por aqui.'),
                       style: const TextStyle(color: _inkMuted)))
-              : GridView.builder(
-                  padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
-                  gridDelegate:
-                      const SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: 3,
-                    mainAxisSpacing: 4,
-                    crossAxisSpacing: 4,
-                  ),
-                  itemCount: lista.length,
-                  itemBuilder: (context, i) {
-                    final item = lista[i];
-                    return _CelulaMidia(
-                      key: ValueKey(item.id),
-                      item: item,
-                      selecionado: _selected.contains(item),
-                      noDrive: _enviadosIds.contains(item.id),
-                      tamanho: _fmt(item.bytes),
-                      onTap: () => _toggle(item),
-                      onLongPress: () => Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                              builder: (_) =>
-                                  PreviewPage(item.asset, caminho: item.path))),
-                    );
-                  },
-                ),
+              : _grade(lista),
         ),
       ],
     );
+  }
+
+  /// Lado da miniatura em pixels físicos, pelo tamanho real da célula (antes
+  /// 200 fixo: borrava em tela 1080p). Teto de 360 pra não pesar.
+  int _ladoThumb(BuildContext context) {
+    final mq = MediaQuery.of(context);
+    final lado = (mq.size.width / 3) * mq.devicePixelRatio;
+    return lado.clamp(150, 360).round();
+  }
+
+  Widget _grade(List<MediaItem> lista, {VoidCallback? aoMudar}) {
+    final lado = _ladoThumb(context);
+    return GridView.builder(
+      padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 3,
+        mainAxisSpacing: 4,
+        crossAxisSpacing: 4,
+      ),
+      itemCount: lista.length,
+      itemBuilder: (context, i) {
+        final item = lista[i];
+        return _CelulaMidia(
+          key: ValueKey(item.id),
+          item: item,
+          lado: lado,
+          selecionado: _selected.contains(item),
+          noDrive: _enviadosIds.contains(item.id),
+          tamanho: _fmt(item.bytes),
+          onTap: () {
+            _toggle(item);
+            aoMudar?.call();
+            _dicaPreviaUmaVez();
+          },
+          onLongPress: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                  builder: (_) => PreviewPage(item.asset, caminho: item.path))),
+        );
+      },
+    );
+  }
+
+  /// Barra de baixo: quanto está selecionado + Subir. [fechar] = está numa
+  /// página por cima (pasta) e volta pra tela principal antes de subir.
+  Widget _barraSubir({bool fechar = false}) {
+    return Container(
+      decoration: const BoxDecoration(
+        color: _parchment,
+        border: Border(top: BorderSide(color: _hairline)),
+      ),
+      child: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: Row(
+            children: [
+              Expanded(
+                  child: Text(
+                      '${_milhar(_selected.length)} selecionados • ${_fmt(_totalSelecionado)}')),
+              FilledButton(
+                  onPressed: _selected.isEmpty || _subindoAgora
+                      ? null
+                      : () {
+                          if (fechar) Navigator.pop(context);
+                          _subir();
+                        },
+                  child: const Text('Guardar no Drive')),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  bool _dicaMostrada = false;
+
+  /// Na primeira seleção, ensina que segurar abre a prévia (antes ninguém
+  /// descobria).
+  Future<void> _dicaPreviaUmaVez() async {
+    if (_dicaMostrada) return;
+    _dicaMostrada = true;
+    if (await _store.flag(UploadStore.kDicaPrevia)) return;
+    await _store.setFlag(UploadStore.kDicaPrevia, true);
+    _avisar('Dica: segure uma foto ou vídeo pra ver em tela cheia.');
+  }
+
+  /// Abre a grade de UMA pasta (antes a aba Pastas só tinha checkbox).
+  Future<void> _abrirPasta(Pasta p) async {
+    final itens = List<MediaItem>.of(p.itens)
+      ..sort((a, b) => b.bytes.compareTo(a.bytes));
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => StatefulBuilder(
+          builder: (ctx, setPagina) => Scaffold(
+            appBar: AppBar(
+              title: Text(p.nome),
+              actions: [
+                TextButton(
+                  onPressed: () {
+                    _togglePasta(p, _estadoPasta(p) != true);
+                    setPagina(() {});
+                  },
+                  child: Text(_estadoPasta(p) == true
+                      ? 'Desmarcar todos'
+                      : 'Marcar todos'),
+                ),
+              ],
+            ),
+            body: _grade(itens, aoMudar: () => setPagina(() {})),
+            bottomNavigationBar: _barraSubir(fechar: true),
+          ),
+        ),
+      ),
+    );
+    if (mounted) setState(() {});
   }
 
   Widget _abaPastas() {
     final subiuMapa = _subiuPorPastaMapa;
     return Column(
       children: [
-        _barraAcoes(),
+        _barraAcoes(pastas: true),
         Expanded(
           child: ListView.builder(
             itemCount: _pastas.length,
@@ -3049,10 +3349,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               final subiu = subiuMapa[p.nome] ?? 0;
               final todos = p.itens.length;
               final tudoNoDrive = todos > 0 && subiu >= todos;
-              return CheckboxListTile(
-                value: _pastaToda(p),
-                onChanged: (v) => _togglePasta(p, v),
-                secondary: tudoNoDrive
+              final estado = _estadoPasta(p);
+              return ListTile(
+                onTap: () => _abrirPasta(p),
+                leading: Checkbox(
+                  tristate: true,
+                  value: estado,
+                  // Parcial -> toque seleciona a pasta toda.
+                  onChanged: (_) => _togglePasta(p, estado != true),
+                ),
+                trailing: tudoNoDrive
                     ? const Icon(Icons.cloud_done, color: _actionBlue)
                     : (subiu > 0
                         ? Text('${_milhar(subiu)}/${_milhar(todos)}',
@@ -3075,6 +3381,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 /// subiu, círculo de seleção. Toque seleciona; segurar abre a prévia.
 class _CelulaMidia extends StatelessWidget {
   final MediaItem item;
+  final int lado;
   final bool selecionado;
   final bool noDrive;
   final String tamanho;
@@ -3083,6 +3390,7 @@ class _CelulaMidia extends StatelessWidget {
   const _CelulaMidia({
     super.key,
     required this.item,
+    required this.lado,
     required this.selecionado,
     required this.noDrive,
     required this.tamanho,
@@ -3093,13 +3401,22 @@ class _CelulaMidia extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isVideo = item.asset.type == AssetType.video;
-    return GestureDetector(
+    return Semantics(
+      label:
+          '${isVideo ? 'Vídeo' : 'Foto'} $tamanho${noDrive ? ', já no Drive' : ''}',
+      selected: selecionado,
+      button: true,
+      child: GestureDetector(
       onTap: onTap,
       onLongPress: onLongPress,
       child: Stack(
         fit: StackFit.expand,
         children: [
-          _Thumb(id: item.asset.id, asset: item.asset, isVideo: isVideo),
+          _Thumb(
+              id: item.asset.id,
+              asset: item.asset,
+              isVideo: isVideo,
+              lado: lado),
           if (selecionado)
             Container(color: _actionBlue.withValues(alpha: 0.28)),
           if (isVideo)
@@ -3116,7 +3433,7 @@ class _CelulaMidia extends StatelessWidget {
                 borderRadius: BorderRadius.circular(4),
               ),
               child: Text(tamanho,
-                  style: const TextStyle(color: Colors.white, fontSize: 10)),
+                  style: const TextStyle(color: Colors.white, fontSize: 11)),
             ),
           ),
           if (noDrive)
@@ -3136,6 +3453,7 @@ class _CelulaMidia extends StatelessWidget {
           ),
         ],
       ),
+      ),
     );
   }
 }
@@ -3146,7 +3464,12 @@ class _Thumb extends StatefulWidget {
   final String id;
   final AssetEntity asset;
   final bool isVideo;
-  const _Thumb({required this.id, required this.asset, required this.isVideo});
+  final int lado;
+  const _Thumb(
+      {required this.id,
+      required this.asset,
+      required this.isVideo,
+      this.lado = 200});
 
   @override
   State<_Thumb> createState() => _ThumbState();
@@ -3180,7 +3503,7 @@ class _ThumbState extends State<_Thumb> {
     final token = PMCancelToken();
     _token = token;
     _pronto = false;
-    _fut = _ThumbCache.carregar(widget.asset, token)
+    _fut = _ThumbCache.carregar(widget.asset, token, widget.lado)
         .whenComplete(() => _pronto = true);
   }
 
@@ -3448,6 +3771,180 @@ class _PreviewPageState extends State<PreviewPage> {
                   _video!.value.isPlaying ? Icons.pause : Icons.play_arrow),
             )
           : null,
+    );
+  }
+}
+
+/// Ajustes (rodada 13): o que antes eram ícones soltos na barra de cima.
+class AjustesPage extends StatefulWidget {
+  final bool soWifi;
+  final Future<void> Function(bool) onSoWifi;
+  final VoidCallback? onEspaco;
+  final VoidCallback onRecarregar;
+  final VoidCallback onDiagnostico;
+  final VoidCallback onHistorico;
+  final bool motorNovo;
+  final Future<void> Function(bool) onMotorNovo;
+  const AjustesPage({
+    super.key,
+    required this.soWifi,
+    required this.onSoWifi,
+    required this.onEspaco,
+    required this.onRecarregar,
+    required this.onDiagnostico,
+    required this.onHistorico,
+    required this.motorNovo,
+    required this.onMotorNovo,
+  });
+
+  @override
+  State<AjustesPage> createState() => _AjustesPageState();
+}
+
+class _AjustesPageState extends State<AjustesPage> {
+  late bool _soWifi = widget.soWifi;
+  late bool _motorNovo = widget.motorNovo;
+  bool? _bateria;
+
+  @override
+  void initState() {
+    super.initState();
+    Nativo.bateriaIsenta().then((v) {
+      if (mounted) setState(() => _bateria = v);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Ajustes')),
+      body: ListView(
+        children: [
+          SwitchListTile(
+            value: _soWifi,
+            title: const Text('Subir só no wifi'),
+            subtitle: const Text(
+                'Desligado: usa wifi e dados móveis. Ligado: espera uma rede wifi.'),
+            onChanged: (v) async {
+              setState(() => _soWifi = v);
+              await widget.onSoWifi(v);
+            },
+          ),
+          ListTile(
+            title: const Text('Economia de bateria'),
+            subtitle: Text(_bateria == null
+                ? '…'
+                : (_bateria!
+                    ? 'Liberado: o Android não pausa o backup de madrugada.'
+                    : 'O Android pode pausar backups longos. Toque pra liberar.')),
+            trailing: Icon(
+                _bateria == true ? Icons.check_circle : Icons.battery_alert,
+                color: _bateria == true ? _actionBlue : _inkMuted),
+            onTap: _bateria == true
+                ? null
+                : () async {
+                    await Nativo.pedirIsencaoBateria();
+                    final v = await Nativo.bateriaIsenta();
+                    if (mounted) setState(() => _bateria = v);
+                  },
+          ),
+          const Divider(),
+          ListTile(
+            title: const Text('Histórico de backups'),
+            leading: const Icon(Icons.history),
+            onTap: widget.onHistorico,
+          ),
+          ListTile(
+            title: const Text('Espaço no Drive'),
+            leading: const Icon(Icons.cloud_outlined),
+            enabled: widget.onEspaco != null,
+            onTap: widget.onEspaco,
+          ),
+          ListTile(
+            title: const Text('Recarregar galeria'),
+            subtitle: const Text('Depois de tirar fotos novas ou mudar permissões.'),
+            leading: const Icon(Icons.refresh),
+            onTap: () {
+              Navigator.pop(context);
+              widget.onRecarregar();
+            },
+          ),
+          ListTile(
+            title: const Text('Diagnóstico'),
+            subtitle: const Text('Detalhes técnicos pra mandar se algo travar.'),
+            leading: const Icon(Icons.bug_report_outlined),
+            onTap: widget.onDiagnostico,
+          ),
+          const Divider(),
+          SwitchListTile(
+            value: _motorNovo,
+            title: const Text('Motor novo (experimental)'),
+            subtitle: const Text(
+                'Envia vídeos em partes e continua de onde parou se a rede cair. Use só pra teste.'),
+            onChanged: (v) async {
+              setState(() => _motorNovo = v);
+              await widget.onMotorNovo(v);
+            },
+          ),
+          const Padding(
+            padding: EdgeInsets.all(16),
+            child: Text('Limpa Memória $_versao',
+                style: TextStyle(color: _inkMuted, fontSize: 12)),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Histórico das sessões de backup (lê o sessoes.jsonl).
+class HistoricoPage extends StatelessWidget {
+  final List<Map<String, Object?>> sessoes;
+  const HistoricoPage({super.key, required this.sessoes});
+
+  static String _data(Object? iso) {
+    final d = DateTime.tryParse('${iso ?? ''}')?.toLocal();
+    if (d == null) return '-';
+    String d2(int n) => n.toString().padLeft(2, '0');
+    return '${d2(d.day)}/${d2(d.month)}/${d.year} ${d2(d.hour)}:${d2(d.minute)}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Histórico')),
+      body: sessoes.isEmpty
+          ? const Center(
+              child: Text('Nenhum backup terminado ainda.',
+                  style: TextStyle(color: _inkMuted)))
+          : ListView.separated(
+              itemCount: sessoes.length,
+              separatorBuilder: (_, __) => const Divider(height: 1),
+              itemBuilder: (_, i) {
+                final s = sessoes[i];
+                final arquivos = (s['arquivos'] as num?)?.toInt() ?? 0;
+                final enviados = (s['enviados'] as num?)?.toInt() ?? arquivos;
+                final bytes = (s['bytes'] as num?)?.toInt() ?? 0;
+                final falhas = (s['falhas'] as num?)?.toInt() ?? 0;
+                final ini = DateTime.tryParse('${s['inicio'] ?? ''}');
+                final fim = DateTime.tryParse('${s['fim'] ?? ''}');
+                final dur = (ini != null && fim != null)
+                    ? fim.difference(ini)
+                    : Duration.zero;
+                final durTxt = dur.inHours > 0
+                    ? '${dur.inHours}h${(dur.inMinutes % 60).toString().padLeft(2, '0')}'
+                    : '${dur.inMinutes} min';
+                return ListTile(
+                  leading: Icon(
+                      falhas == 0 ? Icons.cloud_done : Icons.error_outline,
+                      color: falhas == 0 ? _actionBlue : _inkMuted),
+                  title: Text(
+                      '${milhar(enviados)} de ${milhar(arquivos)} arquivos · ${fmtBytes(bytes)}'),
+                  subtitle: Text(
+                      '${_data(s['fim'])} · durou $durTxt${falhas > 0 ? ' · ${milhar(falhas)} não subiram' : ''}'),
+                );
+              },
+            ),
     );
   }
 }

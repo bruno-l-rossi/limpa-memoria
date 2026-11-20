@@ -359,6 +359,24 @@ class UploadStore {
     });
   }
 
+  /// Últimas sessões de backup (mais recente primeiro), pro histórico.
+  Future<List<Map<String, Object?>>> ultimasSessoes({int max = 50}) async {
+    if (_dir == null) return const [];
+    await gravarAgora();
+    final saida = <Map<String, Object?>>[];
+    try {
+      if (!await _fSessoes.exists()) return const [];
+      final linhas = await _fSessoes.readAsLines();
+      for (final l in linhas.reversed) {
+        if (saida.length >= max) break;
+        try {
+          saida.add(Map<String, Object?>.from(jsonDecode(l) as Map));
+        } catch (_) {}
+      }
+    } catch (_) {}
+    return saida;
+  }
+
   // ---------- Diário de eventos (diagnóstico local) ----------
 
   /// Uma linha com data/hora no eventos.log. Gira em 512 KB (guarda o
@@ -424,6 +442,29 @@ class UploadStore {
   Future<void> setSoWifi(bool v) async {
     final p = await SharedPreferences.getInstance();
     await p.setBool(_kWifi, v);
+  }
+
+  // Flags genéricas (rodada 13+).
+  static const kMotorNovo = 'motor_nativo_v1'; // F4: desligado por padrão
+  static const kDicaPrevia = 'dica_previa_v1';
+  static const kTotalLiberado = 'total_liberado_bytes';
+
+  Future<bool> flag(String chave) async {
+    final p = await SharedPreferences.getInstance();
+    return p.getBool(chave) ?? false;
+  }
+
+  Future<void> setFlag(String chave, bool v) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setBool(chave, v);
+  }
+
+  /// Soma de tudo que o app já liberou do celular (tela de resultado).
+  Future<int> somarLiberado(int bytes) async {
+    final p = await SharedPreferences.getInstance();
+    final total = (p.getInt(kTotalLiberado) ?? 0) + bytes;
+    await p.setInt(kTotalLiberado, total);
+    return total;
   }
 
   /// Onboarding da primeira execução: mostrado uma vez só.
