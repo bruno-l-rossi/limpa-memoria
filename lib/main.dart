@@ -66,7 +66,7 @@ ThemeData _tema() {
   );
 }
 
-const String _versao = '1.4.0';
+const String _versao = '1.5.0';
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
