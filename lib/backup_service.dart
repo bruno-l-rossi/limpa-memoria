@@ -8,89 +8,12 @@ import 'package:extension_google_sign_in_as_googleapis_auth/extension_google_sig
 import 'package:googleapis/drive/v3.dart' as drive;
 import 'package:http/http.dart' as http;
 import 'package:photo_manager/photo_manager.dart';
+import 'modelos.dart';
+import 'manutencao_drive.dart';
+import 'pastas.dart';
+import 'diario.dart';
 
-/// Um arquivo pra subir: id (asset.id, vira o taskId), nome, subpasta no Drive,
-/// e (rodada 8) o caminho real no disco e o tamanho, vindos do MediaStore.
-/// Com o caminho real o upload lê o arquivo direto, sem copiar pro cache.
-class ItemBackup {
-  final String id;
-  final String titulo;
-  final String pasta;
-  final String path; // vazio = sem caminho direto, usa o fallback
-  final int bytes; // 0 = desconhecido
-  // Duplicata exata: id do item PRINCIPAL que sobe no lugar deste (mesmo nome
-  // + mesmo tamanho). Item com dup não é enfileirado; quando o principal
-  // confirma, este é marcado como coberto pelo mesmo arquivo do Drive.
-  final String dup;
-
-  ItemBackup(this.id, this.titulo, this.pasta,
-      {this.path = '', this.bytes = 0, this.dup = ''});
-
-  ItemBackup comDup(String novoDup) =>
-      ItemBackup(id, titulo, pasta, path: path, bytes: bytes, dup: novoDup);
-
-  Map<String, String> toMap() => {
-        'id': id,
-        'titulo': titulo,
-        'pasta': pasta,
-        if (path.isNotEmpty) 'path': path,
-        if (bytes > 0) 'bytes': '$bytes',
-        if (dup.isNotEmpty) 'dup': dup,
-      };
-
-  static ItemBackup fromMap(Map<String, String> m) => ItemBackup(
-        m['id'] ?? '',
-        m['titulo'] ?? 'sem nome',
-        m['pasta'] ?? 'Outros',
-        path: m['path'] ?? '',
-        bytes: int.tryParse(m['bytes'] ?? '') ?? 0,
-        dup: m['dup'] ?? '',
-      );
-}
-
-/// Um arquivo como está no Drive (da listagem da pasta Limpa Memória).
-/// Usado pra conferir antes de apagar do celular e pra reconhecer um backup
-/// antigo depois de reinstalar o app.
-class ArquivoDrive {
-  final String fileId;
-  final String nome;
-  final int bytes;
-  final String pasta;
-  ArquivoDrive(this.fileId, this.nome, this.bytes, this.pasta);
-}
-
-/// Metadados que viajam dentro da tarefa do background_downloader.
-/// cache=true significa "o arquivo local é uma cópia no cache do app e pode
-/// ser apagada quando o upload terminar" (nunca apagar o original!).
-class MetaTarefa {
-  final String pasta;
-  final bool cache;
-  final int bytes;
-  final String titulo; // nome no Drive (o filename local pode ser de cache)
-  MetaTarefa(this.pasta, this.cache, this.bytes, {this.titulo = ''});
-
-  String codificar() => jsonEncode({
-        'p': pasta,
-        'c': cache ? 1 : 0,
-        'b': bytes,
-        if (titulo.isNotEmpty) 't': titulo,
-      });
-
-  static MetaTarefa decodificar(String raw) {
-    try {
-      final m = jsonDecode(raw) as Map;
-      return MetaTarefa(
-        m['p']?.toString() ?? 'Outros',
-        (m['c'] as num?)?.toInt() == 1,
-        (m['b'] as num?)?.toInt() ?? 0,
-        titulo: m['t']?.toString() ?? '',
-      );
-    } catch (_) {
-      // metaData das builds antigas era o nome cru da pasta
-      return MetaTarefa(raw.isEmpty ? 'Outros' : raw, false, 0);
-    }
-  }
-}
+export 'modelos.dart';
 
 /// Upload em segundo plano via background_downloader, em JANELA DESLIZANTE.
 ///
@@ -147,7 +70,7 @@ class BackupService {
     FileDownloader().configureNotificationForGroup(
       grupo,
       running: const TaskNotification(
-          'Limpa Memória', 'Fazendo backup… deixe o app aberto na tomada'),
+          'Limpa Memória', 'Fazendo backup…'),
       complete: const TaskNotification(
           'Limpa Memória', 'Fila do Android concluída. Abra o app pra continuar'),
       error: const TaskNotification(
@@ -160,7 +83,9 @@ class BackupService {
     try {
       await FileDownloader()
           .configure(globalConfig: (Config.runInForeground, Config.always));
-    } catch (_) {}
+    } catch (e) {
+      falhaEngolida('configurar primeiro plano', e);
+    }
     try {
       await FileDownloader().permissions.request(PermissionType.notifications);
     } catch (_) {}
@@ -178,7 +103,9 @@ class BackupService {
   static Future<void> limparFilaLegada() async {
     try {
       await FileDownloader().reset(group: grupo);
-    } catch (_) {}
+    } catch (e) {
+      falhaEngolida('limparFilaLegada', e);
+    }
   }
 
   /// Cancela tudo que está na fila do Android (botão Parar). As sessões no
@@ -189,14 +116,18 @@ class BackupService {
       if (ids.isNotEmpty) {
         await FileDownloader().cancelTasksWithIds(ids);
       }
-    } catch (_) {}
+    } catch (e) {
+      falhaEngolida('cancelarTudo', e);
+    }
   }
 
   /// Cancela tarefas específicas (Parar chegou no meio de uma leva).
   static Future<void> cancelar(Iterable<String> ids) async {
     try {
       await FileDownloader().cancelTasksWithIds(ids);
-    } catch (_) {}
+    } catch (e) {
+      falhaEngolida('cancelar', e);
+    }
   }
 
   /// Fonte da verdade do que já subiu: tudo que o banco da biblioteca marca
@@ -220,7 +151,9 @@ class BackupService {
     if (ids.isEmpty) return;
     try {
       await FileDownloader().database.deleteRecordsWithIds(ids);
-    } catch (_) {}
+    } catch (e) {
+      falhaEngolida('limpar registros', e);
+    }
   }
 
   /// Ids que já estão na fila de upload (rodando, esperando ou pra retentar).
@@ -399,7 +332,7 @@ class BackupService {
   /// pro background_downloader. Devolve (ok, erro). Renova o token se expirou.
   static Future<(bool, String?)> enfileirarUm(
       GoogleSignIn gsi, ItemBackup item,
-      {bool soWifi = false}) async {
+      {bool soWifi = false, bool transferenciaLonga = false}) async {
     try {
       final (ok, err) = await garantirContexto(gsi);
       if (!ok) return (false, err);
@@ -412,11 +345,13 @@ class BackupService {
 
       final subId = await _subpasta(gsi, item.pasta);
 
-      var (sessao, erroSessao) = await _criarSessao(_token!, item.titulo, subId);
+      var (sessao, erroSessao) =
+          await _criarSessao(_token!, item.titulo, subId, data: item.data);
       if (sessao == null && erroSessao == 'token-expirado') {
         final novo = await _renovarToken(gsi);
         if (novo != null) {
-          (sessao, erroSessao) = await _criarSessao(novo, item.titulo, subId);
+          (sessao, erroSessao) =
+              await _criarSessao(novo, item.titulo, subId, data: item.data);
         }
         if (sessao == null && erroSessao == 'token-expirado') {
           erroSessao = '${prefixoRede}login do Google expirou, renovando';
@@ -444,6 +379,11 @@ class BackupService {
         // de rede/DNS sem desistir do arquivo.
         retries: 10,
         requiresWiFi: soWifi,
+        // Prioridade 0 + notificação + Android 14+ = UIDT (job iniciado pelo
+        // usuário, sem o teto de 6 h por dia do serviço dataSync). Se o
+        // Android recusar (ex.: app fora da tela), a biblioteca cai sozinha
+        // pro WorkManager, que é o comportamento de antes.
+        priority: transferenciaLonga ? 0 : 5,
         metaData: MetaTarefa(item.pasta, ehCache, item.bytes,
                 titulo: item.titulo)
             .codificar(),
@@ -456,6 +396,33 @@ class BackupService {
     } catch (e) {
       if (_ehTransitorio(e)) return (false, '$prefixoRede$e');
       return (false, '$e');
+    }
+  }
+
+  /// Abre só a sessão retomável de um item (motor novo: quem manda os bytes
+  /// é o UploadRetomavel, em partes). Devolve (url, erro).
+  static Future<(String?, String?)> criarSessaoPara(
+      GoogleSignIn gsi, ItemBackup item) async {
+    try {
+      final (ok, err) = await garantirContexto(gsi);
+      if (!ok) return (null, err);
+      final subId = await _subpasta(gsi, item.pasta);
+      var (sessao, erro) =
+          await _criarSessao(_token!, item.titulo, subId, data: item.data);
+      if (sessao == null && erro == 'token-expirado') {
+        final novo = await _renovarToken(gsi);
+        if (novo != null) {
+          (sessao, erro) =
+              await _criarSessao(novo, item.titulo, subId, data: item.data);
+        }
+        if (sessao == null && erro == 'token-expirado') {
+          erro = '${prefixoRede}login do Google expirou, renovando';
+        }
+      }
+      return (sessao, erro);
+    } catch (e) {
+      if (_ehTransitorio(e)) return (null, '$prefixoRede$e');
+      return (null, '$e');
     }
   }
 
@@ -508,6 +475,104 @@ class BackupService {
     } finally {
       _subCriando.remove(nome);
     }
+  }
+
+  /// Id da subpasta SE ela já existe (não cria). Rodada 18: procurar na pasta
+  /// de nome antigo sem criar pasta vazia no Drive.
+  static Future<String?> _subpastaExistente(
+      GoogleSignIn gsi, String nome) async {
+    final pronto = _subCache[nome];
+    if (pronto != null) return pronto;
+    if (_mainId == null) await prepararContexto(gsi);
+    final main = _mainId;
+    if (main == null) return null;
+    final achadas =
+        await _naApiComGsi(gsi, (api) => _acharPastas(api, nome, main));
+    if (achadas.isEmpty) return null;
+    _subCache[nome] = achadas.first;
+    return achadas.first;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Manutenção do que já subiu (rodada 18)
+  // ---------------------------------------------------------------------------
+
+  /// Move pra pasta de nome novo o que subiu na pasta de nome antigo
+  /// ("Sent" -> "WhatsApp Images › Sent"). Só mexe em pasta (o arquivo, o
+  /// fileId e o conteúdo continuam iguais). Devolve (movidos, falhas) ou null
+  /// se não conseguiu listar o Drive.
+  static Future<(int, int)?> organizarPastas(
+      GoogleSignIn gsi, List<ItemEnviado> itens,
+      {void Function(int feitos, int total)? progresso,
+      bool Function()? cancelado}) async {
+    final mudam =
+        itens.where((e) => pastaLegada(e.item.pasta) != e.item.pasta).toList();
+    if (mudam.isEmpty) return (0, 0);
+    invalidarListagem();
+    final noDrive = await listarNoDrive(gsi, pastas: {
+      for (final e in mudam) ...pastasPossiveis(e.item.pasta),
+    });
+    if (noDrive == null) return null;
+    final plano = planejarMovimentos(mudam, noDrive);
+    var movidos = 0, falhas = 0, feitos = 0;
+    progresso?.call(0, plano.length);
+    for (final m in plano) {
+      if (cancelado?.call() ?? false) break;
+      try {
+        final para = await _subpasta(gsi, m.paraPasta);
+        await _naApi(
+            gsi,
+            (api) => api.files.update(drive.File(), m.fileId,
+                addParents: para, removeParents: m.de, $fields: 'id'));
+        movidos++;
+      } catch (_) {
+        falhas++;
+      }
+      progresso?.call(++feitos, plano.length);
+    }
+    invalidarListagem();
+    return (movidos, falhas);
+  }
+
+  /// Troca a data dos arquivos no Drive pela data da mídia (backups de antes
+  /// da rodada 12 ficaram com a data do upload). Só o "modificado": o Drive
+  /// não deixa mudar a data de criação depois que o arquivo existe.
+  /// Devolve (corrigidos, falhas, jaCertos) ou null se não listou o Drive.
+  static Future<(int, int, int)?> corrigirDatas(
+      GoogleSignIn gsi, List<ItemEnviado> itens,
+      {void Function(int feitos, int total)? progresso,
+      bool Function()? cancelado}) async {
+    if (itens.isEmpty) return (0, 0, 0);
+    invalidarListagem();
+    final noDrive = await listarNoDrive(gsi, pastas: {
+      for (final e in itens) ...pastasPossiveis(e.item.pasta),
+    });
+    if (noDrive == null) return null;
+    final plano = planejarDatas(itens, noDrive);
+    var ok = 0, falhas = 0, feitos = 0, i = 0;
+    progresso?.call(0, plano.length);
+    Future<void> trabalhador() async {
+      while (i < plano.length && !(cancelado?.call() ?? false)) {
+        final c = plano[i++];
+        try {
+          await _naApi(
+              gsi,
+              (api) => api.files.update(
+                  drive.File()..modifiedTime = c.data, c.fileId,
+                  $fields: 'id'));
+          ok++;
+        } catch (_) {
+          falhas++;
+        }
+        progresso?.call(++feitos, plano.length);
+      }
+    }
+
+    // 4 por vez: rápido sem esbarrar no limite de escrita do Drive (o _naApi
+    // já espera e tenta de novo em 403/429 de taxa).
+    await Future.wait([for (var k = 0; k < 4; k++) trabalhador()]);
+    invalidarListagem();
+    return (ok, falhas, itens.length - plano.length);
   }
 
   /// Pré-cria/encontra todas as subpastas de uma leva ANTES de enfileirar em
@@ -610,7 +675,8 @@ class BackupService {
               gsi,
               (api) => api.files.list(
                     q: "'$paiId' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false",
-                    $fields: 'nextPageToken, files(id,name,size)',
+                    $fields:
+                        'nextPageToken, files(id,name,size,md5Checksum,modifiedTime)',
                     pageSize: 1000,
                     pageToken: pt,
                   ),
@@ -622,6 +688,9 @@ class BackupService {
               f.name ?? '',
               int.tryParse(f.size ?? '') ?? 0,
               paiNome,
+              md5: f.md5Checksum,
+              paiId: paiId,
+              modificado: f.modifiedTime,
             ));
           }
           pageToken = res.nextPageToken;
@@ -639,26 +708,36 @@ class BackupService {
   /// Usado antes de re-subir um arquivo que falhou: às vezes o Drive recebeu
   /// tudo e só a resposta se perdeu. Achou = devolve o fileId e não sobe de
   /// novo (sem duplicata). Qualquer erro = null (aí sobe normal).
-  static Future<String?> acharNoDrive(GoogleSignIn gsi, ItemBackup item) async {
+  static Future<(String, String?)?> acharNoDrive(
+      GoogleSignIn gsi, ItemBackup item) async {
     if (item.bytes <= 0) return null;
     try {
       final (ok, _) = await garantirContexto(gsi);
       if (!ok) return null;
-      final sub = await _subpasta(gsi, item.pasta);
-      final res = await _naApi(
-          gsi,
-          (api) => api.files.list(
-                q: "name='${_esc(item.titulo)}' and '$sub' in parents and trashed=false",
-                $fields: 'files(id,size)',
-                pageSize: 10,
-              ),
-          tentativas: 2);
-      for (final f in res.files ?? const <drive.File>[]) {
-        if (f.id != null && int.tryParse(f.size ?? '') == item.bytes) {
-          return f.id;
+      // Rodada 18: a pasta nova e a de antes da mudança de nome. A antiga só
+      // é procurada se já existir (não cria pasta vazia à toa).
+      for (final nome in pastasPossiveis(item.pasta)) {
+        final sub = nome == item.pasta
+            ? await _subpasta(gsi, nome)
+            : await _subpastaExistente(gsi, nome);
+        if (sub == null) continue;
+        final res = await _naApi(
+            gsi,
+            (api) => api.files.list(
+                  q: "name='${_esc(item.titulo)}' and '$sub' in parents and trashed=false",
+                  $fields: 'files(id,size,md5Checksum)',
+                  pageSize: 10,
+                ),
+            tentativas: 2);
+        for (final f in res.files ?? const <drive.File>[]) {
+          if (f.id != null && int.tryParse(f.size ?? '') == item.bytes) {
+            return (f.id!, f.md5Checksum);
+          }
         }
       }
-    } catch (_) {}
+    } catch (e) {
+      falhaEngolida('acharNoDrive', e);
+    }
     return null;
   }
 
@@ -668,14 +747,20 @@ class BackupService {
     try {
       await _naApi(gsi, (api) => api.files.delete(fileId));
       invalidarListagem();
-    } catch (_) {}
+    } catch (e) {
+      falhaEngolida('apagarNoDrive', e);
+    }
   }
 
   // ---------------------------------------------------------------------------
   // Rede: retentativa, renovação de token e classificação de erro
   // ---------------------------------------------------------------------------
 
-  static bool _ehTransitorio(Object e) {
+  static bool _ehTransitorio(Object e) => ehTransitorio(e);
+
+  /// Erro de rede/limite (passa sozinho com espera) ou definitivo? Público
+  /// pra teste.
+  static bool ehTransitorio(Object e) {
     if (e is SocketException ||
         e is http.ClientException ||
         e is TimeoutException ||
@@ -784,7 +869,9 @@ class BackupService {
   /// (o Drive limita quantos arquivos por segundo cada conta cria; com 30 mil
   /// fotos pequenas isso aparece).
   static Future<(String?, String?)> _criarSessao(
-      String token, String nome, String folderId) async {
+      String token, String nome, String folderId,
+      {int data = 0}) async {
+    final corpo = metadadosUpload(nome, folderId, data);
     var espera = const Duration(seconds: 2);
     String? ultimo;
     for (var i = 0; i < 5; i++) {
@@ -801,10 +888,7 @@ class BackupService {
                 'Authorization': 'Bearer $token',
                 'Content-Type': 'application/json; charset=UTF-8',
               },
-              body: jsonEncode({
-                'name': nome,
-                'parents': [folderId],
-              }),
+              body: jsonEncode(corpo),
             )
             .timeout(const Duration(seconds: 30));
         final s = resp.statusCode;
@@ -835,6 +919,28 @@ class BackupService {
       }
     }
     return (null, ultimo ?? '${prefixoRede}falha de rede ao preparar');
+  }
+
+  /// Metadados do arquivo novo no Drive. Rodada 12: com a data da mídia
+  /// (modifiedTime e createdTime), senão o Drive mostra tudo com a data do
+  /// upload e, depois de apagar do celular, o "quando" de cada foto se perde.
+  static Map<String, Object> metadadosUpload(
+      String nome, String folderId, int dataMs) {
+    final m = <String, Object>{
+      'name': nome,
+      'parents': [folderId],
+    };
+    // Datas absurdas (0, antes de 1990, no futuro) ficam de fora.
+    final minimo = DateTime.utc(1990).millisecondsSinceEpoch;
+    final maximo =
+        DateTime.now().add(const Duration(days: 2)).millisecondsSinceEpoch;
+    if (dataMs > minimo && dataMs < maximo) {
+      final iso = DateTime.fromMillisecondsSinceEpoch(dataMs, isUtc: true)
+          .toIso8601String();
+      m['modifiedTime'] = iso;
+      m['createdTime'] = iso;
+    }
+    return m;
   }
 
   /// Extrai fileId, tamanho e MD5 da resposta final de um upload concluído.

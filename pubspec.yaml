@@ -1,5 +1,5 @@
 name: limpa_memoria
-description: "A new Flutter project."
+description: "Libera espaço no celular guardando fotos e vídeos no Google Drive."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.4.0+5
+version: 1.6.0+7
 
 environment:
   sdk: ^3.12.2
@@ -30,18 +30,21 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  # Rodada 18: o Material saiu do pacote flutter (deprecado no 3.47).
+  material_ui: ^1.11.1
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
-  photo_manager: ^3.9.0
+  photo_manager: ^3.12.0
   video_player: ^2.11.1
   google_sign_in: ^6.2.1
   googleapis: ^16.0.0
   extension_google_sign_in_as_googleapis_auth: ^2.0.13
-  google_fonts: ^8.1.0
   # Backup em segundo plano + retomada de progresso
-  background_downloader: ^9.5.5
+  # 9.6.4+: o modo UIDT (Android 14+) marca o job como iniciado pelo usuário
+  # de verdade (setUserInitiated). Na 9.5.5 virava job comum de 10 min.
+  background_downloader: ^9.6.4
   shared_preferences: ^2.3.2
   http: ^1.2.2
 
@@ -66,6 +69,20 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  # Inter embutida (rodada 13): antes o google_fonts baixava da internet na
+  # primeira abertura; offline aparecia a fonte errada. Licença OFL em
+  # assets/fonts/Inter-LICENSE.txt.
+  fonts:
+    - family: Inter
+      fonts:
+        - asset: assets/fonts/Inter-Regular.ttf
+        - asset: assets/fonts/Inter-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/Inter-SemiBold.ttf
+          weight: 600
+        - asset: assets/fonts/Inter-Bold.ttf
+          weight: 700
 
   # To add assets to your application, add an assets section, like this:
   # assets:
