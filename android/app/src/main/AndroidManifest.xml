@@ -18,6 +18,12 @@
     <!-- Backup de horas: pedir isenção do Doze pra madrugada não matar o job.
          O pedido abre o diálogo do próprio Android, o usuário decide. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+    <!-- Rodada 14: transferência iniciada pelo usuário (UIDT, Android 14+).
+         Sem o teto de 6 h do serviço dataSync. Só é usada com o ajuste
+         "Transferência longa" ligado; sem a permissão a biblioteca volta
+         sozinha pro modo normal. O serviço UIDTJobService já vem declarado
+         no manifesto da biblioteca. -->
+    <uses-permission android:name="android.permission.RUN_USER_INITIATED_JOBS"/>
     <application
         android:label="Limpa Memória"
         android:name="${applicationName}"
@@ -25,6 +31,16 @@
         android:icon="@mipmap/ic_launcher">
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false" />
+        <!-- Rodada 19 (F4): motor nativo do backup. UIDT no Android 14+;
+             serviço em primeiro plano (dataSync) abaixo disso. -->
+        <service
+            android:name=".MotorJobService"
+            android:permission="android.permission.BIND_JOB_SERVICE"
+            android:exported="false" />
+        <service
+            android:name=".MotorService"
             android:foregroundServiceType="dataSync"
             android:exported="false" />
         <activity

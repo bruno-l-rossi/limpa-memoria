@@ -8,11 +8,16 @@ import 'package:shared_preferences/shared_preferences.dart';
 class EnvioInfo {
   final String? fileId;
   final int? bytes;
-  const EnvioInfo({this.fileId, this.bytes});
+  // Rodada 12: true = o MD5 local foi conferido contra o do Drive quando
+  // subiu. Linhas antigas (sem "v") valem como NÃO verificadas: o apagar
+  // confere o MD5 antes de tirar do celular.
+  final bool verificado;
+  const EnvioInfo({this.fileId, this.bytes, this.verificado = false});
 }
 
-/// Um envio pra gravar em lote: id local, fileId no Drive, tamanho.
-typedef NovoEnvio = ({String id, String? fileId, int? bytes});
+/// Um envio pra gravar em lote: id local, fileId no Drive, tamanho e se o
+/// conteúdo foi conferido por MD5.
+typedef NovoEnvio = ({String id, String? fileId, int? bytes, bool verificado});
 
 /// Persistência no celular do que já subiu e do backup em andamento.
 ///
@@ -123,7 +128,10 @@ class UploadStore {
       // Parse de dezenas de milhares de linhas fora da thread da tela.
       final (mapa, linhas) = await compute(_parseEnviados, f.path);
       mapa.forEach((id, v) {
-        _enviados[id] = EnvioInfo(fileId: v[0] as String?, bytes: v[1] as int?);
+        _enviados[id] = EnvioInfo(
+            fileId: v[0] as String?,
+            bytes: v[1] as int?,
+            verificado: v[2] == true);
       });
       // Muitas linhas repetidas (atualizações de fileId, regravações)?
       // Compacta uma vez: boot seguinte lê menos.
@@ -169,6 +177,7 @@ class UploadStore {
     final m = <String, Object>{'id': id};
     if (info.fileId != null) m['fileId'] = info.fileId!;
     if (info.bytes != null) m['bytes'] = info.bytes!;
+    if (info.verificado) m['v'] = 1;
     return jsonEncode(m);
   }
 
@@ -195,16 +204,23 @@ class UploadStore {
 
   /// Aplica um envio em memória e devolve a linha a gravar (ou null se não
   /// mudou nada).
-  String? _aplicar(String id, String? fileId, int? bytes) {
+  String? _aplicar(String id, String? fileId, int? bytes, bool verificado) {
     final atual = _enviados[id];
+    // fileId novo e diferente = outro arquivo no Drive: a verificação antiga
+    // não vale pra ele.
+    final trocouArquivo =
+        fileId != null && atual?.fileId != null && atual!.fileId != fileId;
+    final v = verificado || (!trocouArquivo && (atual?.verificado ?? false));
     if (atual != null &&
         (fileId == null || atual.fileId == fileId) &&
-        (bytes == null || atual.bytes == bytes)) {
+        (bytes == null || atual.bytes == bytes) &&
+        v == atual.verificado) {
       return null; // nada novo pra gravar
     }
     final info = EnvioInfo(
       fileId: fileId ?? atual?.fileId,
       bytes: bytes ?? atual?.bytes,
+      verificado: v,
     );
     _enviados[id] = info;
     return _linha(id, info);
@@ -222,8 +238,9 @@ class UploadStore {
 
   /// Marca como enviado e grava NA HORA (uma linha em append; barato).
   /// Se já estava marcado e chega um fileId/tamanho novo, atualiza.
-  Future<void> marcarEnviado(String id, {String? fileId, int? bytes}) async {
-    final linha = _aplicar(id, fileId, bytes);
+  Future<void> marcarEnviado(String id,
+      {String? fileId, int? bytes, bool verificado = false}) async {
+    final linha = _aplicar(id, fileId, bytes, verificado);
     if (linha != null) _append('$linha\n');
   }
 
@@ -231,7 +248,7 @@ class UploadStore {
   Future<void> marcarEnviadosEmLote(Iterable<NovoEnvio> envios) async {
     final buf = StringBuffer();
     for (final e in envios) {
-      final linha = _aplicar(e.id, e.fileId, e.bytes);
+      final linha = _aplicar(e.id, e.fileId, e.bytes, e.verificado);
       if (linha != null) buf.writeln(linha);
     }
     if (buf.isNotEmpty) _append(buf.toString());
@@ -342,6 +359,24 @@ class UploadStore {
     });
   }
 
+  /// Últimas sessões de backup (mais recente primeiro), pro histórico.
+  Future<List<Map<String, Object?>>> ultimasSessoes({int max = 50}) async {
+    if (_dir == null) return const [];
+    await gravarAgora();
+    final saida = <Map<String, Object?>>[];
+    try {
+      if (!await _fSessoes.exists()) return const [];
+      final linhas = await _fSessoes.readAsLines();
+      for (final l in linhas.reversed) {
+        if (saida.length >= max) break;
+        try {
+          saida.add(Map<String, Object?>.from(jsonDecode(l) as Map));
+        } catch (_) {}
+      }
+    } catch (_) {}
+    return saida;
+  }
+
   // ---------- Diário de eventos (diagnóstico local) ----------
 
   /// Uma linha com data/hora no eventos.log. Gira em 512 KB (guarda o
@@ -409,6 +444,53 @@ class UploadStore {
     await p.setBool(_kWifi, v);
   }
 
+  // Flags genéricas (rodada 13+).
+  static const kDicaPrevia = 'dica_previa_v2'; // v2: arrasto (rodada 18)
+  static const kTotalLiberado = 'total_liberado_bytes';
+  static const kLixeira = 'apagar_pra_lixeira_v1'; // rodada 18
+  static const kDicaAberto = 'dica_app_aberto_v1'; // rodada 18
+  static const kTema = 'tema_v1'; // 'sistema' | 'claro' | 'escuro'
+  // Rodada 19 (F4): motor nativo (sobe com o app fechado) e até onde o app já
+  // leu o resultados.jsonl dele.
+  // v2 (rodada 21): padrão ligado. O v1 era desligado por padrão; quem
+  // ligou na 1.7/1.8 continua ligado.
+  static const kMotorFechado = 'motor_app_fechado_v2';
+  static const kOffsetNativo = 'motor_nativo_offset_v1';
+
+  Future<String?> texto(String chave) async {
+    final p = await SharedPreferences.getInstance();
+    return p.getString(chave);
+  }
+
+  Future<void> setTexto(String chave, String v) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setString(chave, v);
+  }
+
+  /// Como flag(), mas com valor padrão quando a pessoa nunca mexeu.
+  Future<bool> flagOu(String chave, {required bool padrao}) async {
+    final p = await SharedPreferences.getInstance();
+    return p.getBool(chave) ?? padrao;
+  }
+
+  Future<bool> flag(String chave) async {
+    final p = await SharedPreferences.getInstance();
+    return p.getBool(chave) ?? false;
+  }
+
+  Future<void> setFlag(String chave, bool v) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setBool(chave, v);
+  }
+
+  /// Soma de tudo que o app já liberou do celular (tela de resultado).
+  Future<int> somarLiberado(int bytes) async {
+    final p = await SharedPreferences.getInstance();
+    final total = (p.getInt(kTotalLiberado) ?? 0) + bytes;
+    await p.setInt(kTotalLiberado, total);
+    return total;
+  }
+
   /// Onboarding da primeira execução: mostrado uma vez só.
   static const _kViuOnboarding = 'viu_onboarding_v1';
 
@@ -436,10 +518,15 @@ class UploadStore {
 
 // ---------- Funções de isolate (top-level: só o argumento atravessa) ----------
 
-(Map<String, List<Object?>>, int) _parseEnviados(String caminho) {
+(Map<String, List<Object?>>, int) _parseEnviados(String caminho) =>
+    parseLinhasEnviados(File(caminho).readAsLinesSync());
+
+/// Parse das linhas do enviados.jsonl (público pra teste). Devolve
+/// id -> [fileId, bytes, verificado] e quantas linhas não vazias havia.
+(Map<String, List<Object?>>, int) parseLinhasEnviados(List<String> linhas) {
   final m = <String, List<Object?>>{};
   var n = 0;
-  for (final l in File(caminho).readAsLinesSync()) {
+  for (final l in linhas) {
     if (l.trim().isEmpty) continue;
     n++;
     try {
@@ -447,10 +534,15 @@ class UploadStore {
       final id = j['id']?.toString();
       if (id == null || id.isEmpty) continue;
       final ant = m[id];
-      // Linha mais nova vence, mas não apaga fileId/bytes já sabidos.
+      // Linha mais nova vence, mas não apaga fileId/bytes já sabidos. A
+      // verificação acompanha o fileId: fileId novo sem "v" zera.
+      final fid = j['fileId']?.toString();
+      final trocou = fid != null && ant?[0] != null && ant![0] != fid;
+      final v = j['v'] == 1 || (!trocou && ant?[2] == true);
       m[id] = [
-        j['fileId']?.toString() ?? ant?[0],
+        fid ?? ant?[0],
         (j['bytes'] as num?)?.toInt() ?? ant?[1],
+        v,
       ];
     } catch (_) {
       // linha meio escrita num kill: ignora, o resto do arquivo vale
