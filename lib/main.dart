@@ -35,7 +35,7 @@ part 'home_telas.dart';
 
 void main() => runApp(const MyApp());
 
-const String _versao = '1.7.0';
+const String _versao = '1.8.0';
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
@@ -158,6 +158,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final Map<String, ItemNativo> _noNativo = {}; // entregues ao motor nativo
   EstadoNativo? _estadoNativo;
   int _offsetNativo = 0;
+  int _geracaoNativo = 0; // geração do resultados.jsonl (rodada 20)
   bool _offsetNativoLido = false;
   bool _importandoNativo = false;
   DateTime? _semVidaDesde;

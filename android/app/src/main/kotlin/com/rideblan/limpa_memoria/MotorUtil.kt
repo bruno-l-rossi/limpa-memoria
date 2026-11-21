@@ -84,6 +84,29 @@ object MotorUtil {
         return """{"name":${json(nome)},"parents":[${json(paiId)}]$datas}"""
     }
 
+    /// Até este tamanho o arquivo sobe num pedido só (multipart), sem abrir
+    /// sessão: metade das idas ao Drive pra foto pequena (rodada 20, A-13a).
+    const val TETO_MULTIPART = 5L * 1024 * 1024
+
+    /// Consulta do Drive por nome dentro de uma pasta (pra não duplicar quando
+    /// um pedido multipart caiu sem resposta).
+    fun qBusca(nome: String, paiId: String): String {
+        fun esc(x: String) = x.replace("\\", "\\\\").replace("'", "\\'")
+        return "name='${esc(nome)}' and '${esc(paiId)}' in parents and trashed=false"
+    }
+
+    /// Começo e fim do corpo multipart/related (o conteúdo vai no meio).
+    fun multipartInicio(fronteira: String, metadado: String, mime: String): String =
+        "--$fronteira\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n$metadado\r\n" +
+            "--$fronteira\r\nContent-Type: $mime\r\n\r\n"
+
+    fun multipartFim(fronteira: String): String = "\r\n--$fronteira--\r\n"
+
+    /// Pode limpar o resultados.jsonl? Só se o app já leu tudo desta geração.
+    fun podeRotacionar(geracaoArquivo: Long, tamanho: Long, lidoGeracao: Long, lidoOffset: Long,
+                       minimo: Long = 256 * 1024): Boolean =
+        tamanho >= minimo && lidoGeracao == geracaoArquivo && lidoOffset == tamanho
+
     /// Texto de estimativa pra notificação ("~2h10 restantes").
     fun eta(bytesRestantes: Long, bytesPorSeg: Double): String {
         if (bytesPorSeg <= 0 || bytesRestantes <= 0) return ""

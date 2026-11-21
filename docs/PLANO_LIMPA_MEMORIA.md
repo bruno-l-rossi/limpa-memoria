@@ -2,11 +2,34 @@
 
 ## ESTADO DA EXECUÇÃO (atualizado 2026-11-20) — LEIA PRIMEIRO
 
-Branch `rodadas-12-a-17` (a partir de `main` 85efe74). Versão 1.7.0+8.
-**Rodada 19 (2026-11-21) compilada e testada na nuvem** (Flutter 3.50.1):
-`flutter analyze` sem aviso, 70 testes Dart, 7 testes JUnit do Kotlin, APK
-debug e release. Ainda NÃO foi testado em aparelho: nada das rodadas 12 a 19
-rodou num celular. O Bruno decidiu testar tudo de uma vez, depois da 19.
+Branch `rodadas-12-a-17` (a partir de `main` 85efe74). Versão 1.8.0+9.
+**Rodada 20 (2026-11-21) compilada e testada na nuvem** (Flutter 3.50.1):
+`flutter analyze` sem aviso, 71 testes Dart, 10 testes JUnit, APK release.
+Ainda NÃO foi testado em aparelho (nada das rodadas 12 a 20).
+
+Feito na rodada 20 (motor do app fechado):
+- A-13a: arquivo até 5 MB sobe num pedido só (multipart), metade das idas
+  ao Drive pra foto. Antes de mandar, o id vai pro `motor/multipart.txt`; se
+  o pedido cair sem resposta, a volta seguinte procura no Drive (nome + pasta
+  + tamanho + MD5) antes de subir de novo. Nada de duplicata.
+- "Só no wifi" vale na hora: o motor relê o `config.json` a cada volta e o
+  app avisa quando muda.
+- `resultados.jsonl` não cresce pra sempre: 1ª linha `{"geracao": N}`; o app
+  manda em `fila.json` até onde leu (`lido`); o motor só recomeça o arquivo
+  quando o app leu tudo daquela geração. O app relê a geração antes e depois
+  de cada leitura. `multipart.txt` mantém quem ainda não tem resultado.
+- A-30 já estava completo (rótulo de acessibilidade nas células, selo 11 px,
+  "0 B"). T5.3 já estava feito (só Android no repo).
+
+O que falta e por quê (nada disso dá pra fazer daqui sem risco):
+- T4.5 tirar o motor antigo (background_downloader, janela, reconciliação,
+  órfãos) e ligar o do app fechado por padrão: só depois do teste no
+  aparelho. O plano manda manter o antigo atrás de flag por 1 versão.
+- A-19 google_sign_in 7: precisa do client ID web (docs/PUBLICAR.md, passo
+  6). Sem ele o login quebra.
+- A-35 publicar o consentimento OAuth: clique do Bruno no Google Cloud
+  (docs/PUBLICAR.md, passo 3).
+- Aviso de KGP do photo_manager: depende de versão nova do plugin.
 
 Feito na rodada 19:
 - F4 motor do app fechado (Ajustes > Em teste > "Subir com o app fechado",

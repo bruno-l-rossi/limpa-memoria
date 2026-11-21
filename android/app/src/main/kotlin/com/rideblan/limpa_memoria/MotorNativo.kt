@@ -67,6 +67,8 @@ object MotorNativo {
 
     private val rodando = AtomicBoolean(false)
     @Volatile private var parar = false
+    // Rodada 20: relido do config.json a cada volta (o app pode mudar no meio).
+    @Volatile private var soWifi = false
     @Volatile var paradoPeloUsuario = false
 
     fun dir(ctx: Context): File = File(ctx.filesDir, "motor").apply { mkdirs() }
@@ -181,8 +183,13 @@ object MotorNativo {
         val d = dir(ctx)
         val cfg = lerJson(File(d, "config.json")) ?: return false
         val email = cfg.optString("email")
-        val soWifi = cfg.optBoolean("soWifi", false)
+        soWifi = cfg.optBoolean("soWifi", false)
         if (email.isEmpty()) return false
+        val cfgArq = File(d, "config.json")
+        var cfgMod = cfgArq.lastModified()
+        // Rodada 20: limpa o resultados.jsonl se o app já leu tudo.
+        rotacionarResultados(ctx, d)
+        val tentadosMultipart = lerTentados(d)
         val token = Token(ctx, email)
         val est = Estado()
         val feitos = lerConcluidos(d)
@@ -236,6 +243,10 @@ object MotorNativo {
         try {
             while (!parar) {
                 recarregarFila()
+                if (cfgArq.lastModified() != cfgMod) {
+                    cfgMod = cfgArq.lastModified()
+                    lerJson(cfgArq)?.let { soWifi = it.optBoolean("soWifi", soWifi) }
+                }
                 if (est.precisaLogin || est.driveCheio) break
                 if (!temRede(ctx, soWifi)) {
                     est.semRede = true
@@ -247,7 +258,7 @@ object MotorNativo {
                         ativos.incrementAndGet()
                         pool.execute {
                             try {
-                                subirItem(ctx, item, token, est, sessoes, feitos, soWifi)
+                                subirItem(ctx, item, token, est, sessoes, feitos, tentadosMultipart)
                                 if (item.id !in feitos) falhosRodada.add(item.id)
                             } catch (e: Throwable) {
                                 falhosRodada.add(item.id)
@@ -299,7 +310,8 @@ object MotorNativo {
 
     private fun subirItem(
         ctx: Context, item: Item, token: Token, est: Estado,
-        sessoes: MutableMap<String, Sessao>, feitos: MutableSet<String>, soWifi: Boolean,
+        sessoes: MutableMap<String, Sessao>, feitos: MutableSet<String>,
+        tentadosMultipart: MutableSet<String>,
     ) {
         val d = dir(ctx)
         val arq = File(item.path)
@@ -313,6 +325,43 @@ object MotorNativo {
         var md5Refeito = false
         while (!parar) {
             try {
+                // Rodada 20 (A-13a): foto pequena sem sessão aberta sobe num
+                // pedido só. Sem sessão não dá pra perguntar "quanto chegou",
+                // então um pedido que caiu sem resposta é conferido no Drive
+                // (nome + pasta + tamanho + MD5) antes de mandar de novo.
+                if (total <= MotorUtil.TETO_MULTIPART && sessoes[item.id] == null) {
+                    if (item.id in tentadosMultipart) {
+                        val achado = acharNoDrive(item, total, token)
+                        if (achado != null) {
+                            val (fid, md5Drive) = achado
+                            val md5Local = md5Arquivo(arq)
+                            if (md5Drive == null || md5Local == md5Drive) {
+                                resultadoOk(d, item, fid, total, md5Drive != null && md5Local == md5Drive, est)
+                                feitos.add(item.id)
+                                somarBytes(est, total)
+                                return
+                            }
+                        }
+                    }
+                    marcarTentado(d, item.id, tentadosMultipart)
+                    val (resp, md5Local) = mandarMultipart(item, arq, total, token)
+                    val fileId = resp.optString("id")
+                    if (fileId.isEmpty()) throw IOException("Drive respondeu sem id")
+                    val md5Drive = resp.optString("md5Checksum").ifEmpty { null }
+                    if (md5Drive != null && md5Local != md5Drive) {
+                        try { apagarNoDrive(fileId, token) } catch (_: Exception) {}
+                        if (md5Refeito) {
+                            resultadoFalha(d, item, "conteúdo chegou diferente no Drive", true, est)
+                            return
+                        }
+                        md5Refeito = true
+                        continue
+                    }
+                    somarBytes(est, total)
+                    resultadoOk(d, item, fileId, total, md5Drive != null, est)
+                    feitos.add(item.id)
+                    return
+                }
                 var s = sessoes[item.id]
                 if (s != null && s.total != total) s = null // arquivo mudou
                 var offset = 0L
@@ -574,6 +623,61 @@ object MotorNativo {
         if (dt < 10) 0.0 else (b.second - a.second) / dt
     }
 
+    /// Arquivo inteiro num pedido (multipart/related). Devolve a resposta e o
+    /// MD5 calculado na mesma leitura.
+    private fun mandarMultipart(item: Item, arq: File, total: Long, token: Token): Pair<JSONObject, String> {
+        val dados = arq.readBytes()
+        if (dados.size.toLong() != total) throw IOException("arquivo mudou durante a leitura")
+        val md5 = hex(MessageDigest.getInstance("MD5").digest(dados))
+        val fronteira = "limpa" + java.util.UUID.randomUUID().toString().replace("-", "")
+        val ini = MotorUtil.multipartInicio(fronteira,
+            MotorUtil.metadado(item.titulo, item.paiId, item.data), mime(item.titulo)).toByteArray()
+        val fim = MotorUtil.multipartFim(fronteira).toByteArray()
+        val c = abrir("https://www.googleapis.com/upload/drive/v3/files" +
+            "?uploadType=multipart&fields=id,size,md5Checksum")
+        try {
+            c.requestMethod = "POST"
+            c.doOutput = true
+            c.setRequestProperty("Authorization", "Bearer ${token.valor()}")
+            c.setRequestProperty("Content-Type", "multipart/related; boundary=$fronteira")
+            c.setFixedLengthStreamingMode(ini.size + dados.size + fim.size)
+            c.outputStream.use {
+                it.write(ini)
+                it.write(dados)
+                it.write(fim)
+            }
+            val (cod, corpo) = ler(c)
+            if (cod != 200) throw HttpErro(cod, corpo, false)
+            return JSONObject(corpo ?: "{}") to md5
+        } finally {
+            conexoes.remove(c)
+            c.disconnect()
+        }
+    }
+
+    /// Procura o arquivo no Drive (nome + pasta + tamanho): (id, md5) ou null.
+    private fun acharNoDrive(item: Item, total: Long, token: Token): Pair<String, String?>? {
+        val q = java.net.URLEncoder.encode(MotorUtil.qBusca(item.titulo, item.paiId), "UTF-8")
+        val c = abrir("https://www.googleapis.com/drive/v3/files?q=$q" +
+            "&fields=files(id,size,md5Checksum)&pageSize=10")
+        try {
+            c.setRequestProperty("Authorization", "Bearer ${token.valor()}")
+            val (cod, corpo) = ler(c)
+            if (cod != 200) throw HttpErro(cod, corpo, false)
+            val arr = JSONObject(corpo ?: "{}").optJSONArray("files") ?: return null
+            for (i in 0 until arr.length()) {
+                val f = arr.optJSONObject(i) ?: continue
+                if (f.optString("size").toLongOrNull() == total) {
+                    return f.optString("id") to f.optString("md5Checksum").ifEmpty { null }
+                }
+            }
+            return null
+        } finally {
+            conexoes.remove(c)
+            c.disconnect()
+        }
+    }
+
     private fun apagarNoDrive(fileId: String, token: Token) {
         if (fileId.isEmpty()) return
         val c = abrir("https://www.googleapis.com/drive/v3/files/$fileId")
@@ -656,6 +760,62 @@ object MotorNativo {
         FileOutputStream(File(d, "resultados.jsonl"), true).use {
             it.write((j.toString() + "\n").toByteArray())
             it.fd.sync() // 1 linha por arquivo: barato, e um kill não perde o "subiu"
+        }
+    }
+
+    private val travaTent = Any()
+
+    private fun lerTentados(d: File): MutableSet<String> {
+        val s = ConcurrentHashMap.newKeySet<String>()
+        val f = File(d, "multipart.txt")
+        if (f.exists()) f.forEachLine { if (it.isNotBlank()) s.add(it.trim()) }
+        return s
+    }
+
+    /// Anota ANTES de mandar: se o pedido cair sem resposta, a próxima vez
+    /// confere no Drive em vez de subir de novo.
+    private fun marcarTentado(d: File, id: String, s: MutableSet<String>) {
+        if (!s.add(id)) return
+        synchronized(travaTent) {
+            FileOutputStream(File(d, "multipart.txt"), true).use {
+                it.write((id + "\n").toByteArray())
+                it.fd.sync()
+            }
+        }
+    }
+
+    /// Geração do resultados.jsonl: a 1ª linha é {"geracao": N}. 0 = arquivo
+    /// antigo, sem cabeçalho.
+    private fun geracao(f: File): Long = try {
+        f.bufferedReader().use { r -> JSONObject(r.readLine() ?: "{}").optLong("geracao", 0) }
+    } catch (_: Exception) { 0 }
+
+    /// Rodada 20: o resultados.jsonl crescia pra sempre. Recomeça o arquivo
+    /// (geração nova) só quando o app avisou, pela fila, que leu até o fim
+    /// desta geração. Assim nenhum "subiu" se perde.
+    private fun rotacionarResultados(ctx: Context, d: File) {
+        val f = File(d, "resultados.jsonl")
+        val lido = lerJson(File(d, "fila.json"))?.optJSONObject("lido")
+        try {
+            if (!f.exists()) {
+                escreverAtomico(f, JSONObject().put("geracao", System.currentTimeMillis()).toString() + "\n")
+                return
+            }
+            if (lido == null || !MotorUtil.podeRotacionar(
+                    geracao(f), f.length(), lido.optLong("geracao", -1), lido.optLong("offset", -1))) return
+            // Pedido pequeno que caiu sem resposta continua anotado (só sai
+            // quem já tem resultado): a conferência no Drive não se perde.
+            val concluidos = lerConcluidos(d)
+            val tent = File(d, "multipart.txt")
+            if (tent.exists()) {
+                val ficam = tent.readLines().map { it.trim() }
+                    .filter { it.isNotEmpty() && it !in concluidos }
+                escreverAtomico(tent, ficam.joinToString("") { it + "\n" })
+            }
+            escreverAtomico(f, JSONObject().put("geracao", System.currentTimeMillis()).toString() + "\n")
+            registrar(ctx, "resultados.jsonl recomeçado (o app já tinha lido tudo)")
+        } catch (e: Exception) {
+            registrar(ctx, "rotacionar: $e")
         }
     }
 

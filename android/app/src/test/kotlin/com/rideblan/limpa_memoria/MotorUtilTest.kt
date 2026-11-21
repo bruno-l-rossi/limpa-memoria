@@ -75,4 +75,29 @@ class MotorUtilTest {
         assertEquals("~2 min restantes", MotorUtil.eta(120 * 1000, 1000.0))
         assertEquals("~1h05 restantes", MotorUtil.eta(3900 * 1000, 1000.0))
     }
+
+    @Test
+    fun buscaEscapaAspas() {
+        assertEquals("name='d\\'água.jpg' and 'p1' in parents and trashed=false",
+            MotorUtil.qBusca("d'água.jpg", "p1"))
+    }
+
+    @Test
+    fun multipartBemFormado() {
+        val ini = MotorUtil.multipartInicio("b1", "{}", "image/jpeg")
+        assertTrue(ini.startsWith("--b1\r\nContent-Type: application/json"))
+        assertTrue(ini.endsWith("Content-Type: image/jpeg\r\n\r\n"))
+        assertEquals("\r\n--b1--\r\n", MotorUtil.multipartFim("b1"))
+    }
+
+    @Test
+    fun rotacionaSoQuandoOAppLeuTudo() {
+        assertTrue(MotorUtil.podeRotacionar(7, 300_000, 7, 300_000))
+        // app leu menos: não pode (perderia o "subiu" de alguém)
+        assertTrue(!MotorUtil.podeRotacionar(7, 300_000, 7, 299_000))
+        // geração diferente: não pode
+        assertTrue(!MotorUtil.podeRotacionar(7, 300_000, 6, 300_000))
+        // pequeno: não vale a pena
+        assertTrue(!MotorUtil.podeRotacionar(7, 1000, 7, 1000))
+    }
 }

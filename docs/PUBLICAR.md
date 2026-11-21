@@ -3,6 +3,11 @@
 Passo a passo pra sair do modo de teste. Nada aqui é código: é configuração
 no computador e no Google Cloud. Faça na ordem.
 
+**Uso próprio (decisão de 2026-11-20):** só o passo 3 importa. Ele acaba com
+o "pede pra logar de novo" e não mexe em código nem em chave. Os passos 1 e 2
+são pra quando trocar a chave de assinatura (trocar a chave sem o passo 2
+quebra o login). O passo 6 prepara o login novo do Google (achado A-19).
+
 ## 1. Chave de assinatura própria (uma vez, guarde pra sempre)
 
 Hoje o APK de release é assinado com a chave de debug do computador. Perder
@@ -64,3 +69,16 @@ pública).
   `RUN_USER_INITIATED_JOBS` (transferência iniciada pelo usuário).
 - Formulário de segurança de dados: o app não coleta dados; os arquivos vão
   direto pro Drive do próprio usuário.
+
+## 6. Client ID web (prepara o login novo do Google, achado A-19)
+
+O app usa o google_sign_in 6, que o Google marcou como antigo. A versão 7
+exige, no Android, um client ID do tipo **Aplicativo da Web** (não substitui o
+de Android, convive com ele). Sem ele, migrar quebraria o login.
+
+Google Cloud Console → APIs e serviços → Credenciais → Criar credencial → ID
+do cliente OAuth → **Aplicativo da Web**. Nome: "Limpa Memória web". Não
+precisa de URL nenhuma. Copie o ID que termina em
+`.apps.googleusercontent.com` e mande pro Claude: com ele, a migração é uma
+rodada curta (o motor do app fechado já usa a API nova de autorização).
+

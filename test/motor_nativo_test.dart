@@ -83,4 +83,19 @@ void main() {
     expect(ResultadoNativo.de('lixo'), isNull);
     expect(ResultadoNativo.de('{"ok":true}'), isNull);
   });
+
+  test('fila leva até onde o app leu; geração vem da 1ª linha', () async {
+    await arq.escreverFila(const [], lido: (geracao: 7, offset: 300));
+    final j = jsonDecode(
+        await File('${tmp.path}/motor/fila.json').readAsString()) as Map;
+    expect(j['lido'], {'geracao': 7, 'offset': 300});
+    expect(await arq.geracao(), -1); // sem resultados ainda
+    final f = File('${tmp.path}/motor/resultados.jsonl');
+    await f.writeAsString('{"geracao":1790000000000}\n{"id":"1","ok":true}\n');
+    expect(await arq.geracao(), 1790000000000);
+    final (r, _) = await arq.lerResultados(0);
+    expect(r.single.id, '1'); // o cabeçalho não vira resultado
+    await f.writeAsString('{"id":"2","ok":true}\n');
+    expect(await arq.geracao(), 0); // arquivo antigo, sem cabeçalho
+  });
 }

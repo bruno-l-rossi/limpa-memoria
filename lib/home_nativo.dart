@@ -10,6 +10,21 @@ part of 'main.dart';
 // duplicatas, celebração). Banner, conclusão e apagar continuam iguais.
 
 extension _MotorNativoHome on _HomePageState {
+  /// Até onde o app já leu o resultados.jsonl (vai na fila pro motor).
+  ({int geracao, int offset})? get _lidoNativo => _offsetNativoLido
+      ? (geracao: _geracaoNativo, offset: _offsetNativo)
+      : null;
+
+  /// "Só no wifi" mudou: avisa o motor que está rodando (ele relê o ajuste).
+  Future<void> _avisarWifiNativo() async {
+    final conta = _conta;
+    if (_noNativo.isEmpty || conta == null || !_emPrimeiroPlano) return;
+    await Nativo.motorIniciar(
+        email: conta.email,
+        soWifi: _soWifi,
+        bytes: _noNativo.values.fold<int>(0, (s, e) => s + e.item.bytes));
+  }
+
   /// Motor nativo valendo nesta sessão do app?
   bool get _usaNativo => _motorFechado && !_nativoRecusado && _arqMotor != null;
 
@@ -77,7 +92,7 @@ extension _MotorNativoHome on _HomePageState {
     for (final e in entregues) {
       _noNativo[e.item.id] = e;
     }
-    await arq.escreverFila(_noNativo.values);
+    await arq.escreverFila(_noNativo.values, lido: _lidoNativo);
     final bytes = _noNativo.values.fold<int>(0, (s, e) => s + e.item.bytes);
     final ok = await Nativo.motorIniciar(
         email: conta.email, soWifi: _soWifi, bytes: bytes);
@@ -85,7 +100,7 @@ extension _MotorNativoHome on _HomePageState {
       for (final e in entregues) {
         _noNativo.remove(e.item.id);
       }
-      await arq.escreverFila(_noNativo.values);
+      await arq.escreverFila(_noNativo.values, lido: _lidoNativo);
       _devolverNaFrente([for (final e in entregues) e.item]);
       _recusarNativo('O Android não deixou ligar o motor do app fechado');
       return;
@@ -112,12 +127,27 @@ extension _MotorNativoHome on _HomePageState {
     _importandoNativo = true;
     try {
       if (!_offsetNativoLido) {
-        _offsetNativo =
-            int.tryParse(await _store.texto(UploadStore.kOffsetNativo) ?? '') ??
-                0;
+        // Gravado como "geração:offset" (rodada 20). Formato antigo: só o offset.
+        final t = await _store.texto(UploadStore.kOffsetNativo) ?? '';
+        final partes = t.split(':');
+        if (partes.length == 2) {
+          _geracaoNativo = int.tryParse(partes[0]) ?? 0;
+          _offsetNativo = int.tryParse(partes[1]) ?? 0;
+        } else {
+          _offsetNativo = int.tryParse(t) ?? 0;
+        }
         _offsetNativoLido = true;
       }
+      // O motor recomeçou o arquivo (geração nova): lê do começo.
+      final g1 = await arq.geracao();
+      if (g1 != _geracaoNativo) {
+        _geracaoNativo = g1;
+        _offsetNativo = 0;
+      }
       final (res, off) = await arq.lerResultados(_offsetNativo);
+      // Recomeçou bem no meio da leitura? Descarta e lê na próxima volta
+      // (aplicar aqui poderia pular linhas da geração nova).
+      if (await arq.geracao() != g1) return;
       for (final r in res) {
         final entregue = _noNativo.remove(r.id);
         if (r.ok) {
@@ -147,7 +177,8 @@ extension _MotorNativoHome on _HomePageState {
       }
       if (off != _offsetNativo) {
         _offsetNativo = off;
-        await _store.setTexto(UploadStore.kOffsetNativo, '$off');
+        await _store.setTexto(
+            UploadStore.kOffsetNativo, '$_geracaoNativo:$off');
       }
 
       final est = await arq.lerEstado();
@@ -188,7 +219,7 @@ extension _MotorNativoHome on _HomePageState {
     if (_noNativo.isEmpty && !_motorFechado) return;
     _noNativo.clear();
     try {
-      await _arqMotor!.escreverFila(const []);
+      await _arqMotor!.escreverFila(const [], lido: _lidoNativo);
     } catch (e) {
       falhaEngolida('esvaziar fila do motor', e);
     }

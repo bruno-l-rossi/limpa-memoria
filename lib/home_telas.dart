@@ -384,6 +384,7 @@ extension _Telas on _HomePageState {
           onSoWifi: (v) async {
             await _store.setSoWifi(v);
             if (mounted) _set(() => _soWifi = v);
+            await _avisarWifiNativo(); // rodada 20: vale na hora
           },
           onEspaco: _conta == null ? null : _checarEspaco,
           onRecarregar: _recarregarGaleria,

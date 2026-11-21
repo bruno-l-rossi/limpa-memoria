@@ -132,14 +132,41 @@ class ArquivosMotor {
   File get _estado => File('${dir.path}/estado.json');
 
   /// Escreve a fila inteira de uma vez (temporário + rename: o motor nunca lê
-  /// um arquivo pela metade).
-  Future<void> escreverFila(Iterable<ItemNativo> itens) async {
+  /// um arquivo pela metade). `lido` diz até onde o app já leu o
+  /// resultados.jsonl (geração e offset): só com isso o motor pode recomeçar
+  /// aquele arquivo (rodada 20).
+  Future<void> escreverFila(Iterable<ItemNativo> itens,
+      {({int geracao, int offset})? lido}) async {
     await dir.create(recursive: true);
     final tmp = File('${_fila.path}.tmp');
     await tmp.writeAsString(
-        jsonEncode({'itens': [for (final i in itens) i.toJson()]}),
+        jsonEncode({
+          'itens': [for (final i in itens) i.toJson()],
+          if (lido != null)
+            'lido': {'geracao': lido.geracao, 'offset': lido.offset},
+        }),
         flush: true);
     await tmp.rename(_fila.path);
+  }
+
+  /// Geração do resultados.jsonl (1ª linha {"geracao": N}); 0 sem cabeçalho,
+  /// -1 se o arquivo não existe.
+  Future<int> geracao() async {
+    try {
+      if (!await _resultados.exists()) return -1;
+      final raf = await _resultados.open();
+      try {
+        final ini = await raf.read(256);
+        final i = ini.indexOf(10);
+        if (i < 0) return 0;
+        final j = jsonDecode(utf8.decode(ini.sublist(0, i), allowMalformed: true));
+        return j is Map && j['geracao'] is num ? (j['geracao'] as num).toInt() : 0;
+      } finally {
+        await raf.close();
+      }
+    } catch (_) {
+      return 0;
+    }
   }
 
   /// Resultados novos a partir de `offset` (bytes). Devolve os resultados e o
