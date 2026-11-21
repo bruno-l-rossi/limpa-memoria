@@ -110,6 +110,7 @@ extension _MotorBackup on _HomePageState {
   /// Ainda tem trabalho no motor (fila, preparo, upload ou conferência).
   bool get _trabalhando =>
       _pendentes.isNotEmpty ||
+      _noNativo.isNotEmpty ||
       _emAndamento.isNotEmpty ||
       _preparando.isNotEmpty ||
       _processando.isNotEmpty ||
@@ -204,6 +205,9 @@ extension _MotorBackup on _HomePageState {
     }
   }
   Future<void> _reconciliarUmaVez() async {
+    // Rodada 19: primeiro o que o motor do app fechado concluiu (pode ter
+    // rodado a noite toda com o app fechado). Não precisa de conta.
+    if (_motorFechado || _noNativo.isNotEmpty) await _importarNativo();
     // Sem conta (boot offline, token perdido): tenta login silencioso de
     // tempos em tempos e retoma sozinho quando voltar.
     if (_conta == null) {
@@ -282,6 +286,7 @@ extension _MotorBackup on _HomePageState {
           _preparando.contains(id) ||
           _processando.contains(id) ||
           _emRetomavel.contains(id) ||
+          _noNativo.containsKey(id) ||
           _falhos.containsKey(id);
       if (ok) {
         _ausentesDesde.remove(id);
@@ -454,6 +459,11 @@ extension _MotorBackup on _HomePageState {
   /// Atualizada no máximo a cada 3s pra não afogar o NotificationManager.
   void _notificarProgresso() {
     if (_emFila.isEmpty || _inicioSessao == null || _fimRegistrado) return;
+    // Motor do app fechado: ele tem a notificação dele (A-20, uma só).
+    if (_noNativo.isNotEmpty) {
+      Nativo.limparNotificacao();
+      return;
+    }
     final total = _bgTotal;
     final feitos = _bgFeitos;
     if (feitos >= total || _pausado) {
@@ -478,6 +488,16 @@ extension _MotorBackup on _HomePageState {
     if (_conta == null || _pausado || _pendentes.isEmpty) return;
     final espera = _esperarRedeAte;
     if (espera != null && DateTime.now().isBefore(espera)) return;
+    // Rodada 19 (F4): com o motor do app fechado, a fila inteira vai pra ele.
+    if (_usaNativo) {
+      _alimentando = true;
+      try {
+        await _alimentarNativo();
+      } finally {
+        _alimentando = false;
+      }
+      return;
+    }
     _alimentando = true;
     final lote = <ItemBackup>[];
     try {
@@ -791,6 +811,11 @@ extension _MotorBackup on _HomePageState {
   }
   Future<void> _pausarPorDriveCheio() async {
     _ev('Drive cheio: backup pausado');
+    if (_noNativo.isNotEmpty) {
+      final volta = [for (final e in _noNativo.values) e.item];
+      await _pararNativo();
+      _devolverNaFrente(volta);
+    }
     await _store.setPausado(true);
     Nativo.limparNotificacao();
     if (mounted) {
@@ -1122,6 +1147,7 @@ extension _MotorBackup on _HomePageState {
       _mudou();
     });
     _ev('Parar (usuário)');
+    await _pararNativo();
     // Cancela o que já estava na fila do Android. Com janela de 40 (vários
     // vídeos grandes), "deixar terminar" podia levar horas.
     await BackupService.cancelarTodos();
@@ -1222,6 +1248,7 @@ extension _MotorBackup on _HomePageState {
     final pausado = await _store.pausado();
     final soWifi = await _store.soWifi();
     final motorNovo = await _store.flag(UploadStore.kMotorNovo);
+    final motorFechado = await _store.flag(UploadStore.kMotorFechado);
     final transfLonga = await _store.flag(UploadStore.kTransferenciaLonga);
     final lixeira = await _store.flag(UploadStore.kLixeira);
     final dicaVista = await _store.flag(UploadStore.kDicaAberto);
@@ -1234,6 +1261,7 @@ extension _MotorBackup on _HomePageState {
       _pausado = pausado;
       _soWifi = soWifi;
       _motorNovo = motorNovo;
+      _motorFechado = motorFechado;
       _transferenciaLonga = transfLonga;
       if (job.isNotEmpty) {
         _carregarSessao(job.map(ItemBackup.fromMap).toList());

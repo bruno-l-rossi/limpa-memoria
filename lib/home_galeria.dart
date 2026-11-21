@@ -56,6 +56,40 @@ extension _Galeria on _HomePageState {
     final all = paths.first;
     final count = await all.assetCountAsync;
 
+    // Rodada 19 (A-15): a galeria inteira numa consulta nativa só (< 1 s com
+    // 30 mil itens), sem paginar pelo photo_manager. Se vier vazia ou com bem
+    // menos itens que o photo_manager conta, cai no caminho antigo abaixo.
+    final cron = Stopwatch()..start();
+    final nativa = await Nativo.galeria();
+    if (nativa != null && nativa.isNotEmpty && nativa.length >= count * 0.9) {
+      final items = [
+        for (final g in nativa)
+          MediaItem(
+            AssetEntity(
+              id: g.id,
+              typeInt: g.tipo,
+              width: g.largura,
+              height: g.altura,
+              duration: g.duracaoSeg,
+              orientation: g.orientacao,
+              title: g.nome,
+              createDateSecond: g.dataSeg,
+              modifiedDateSecond: g.modSeg,
+              relativePath: g.caminhoRel,
+              mimeType: g.mime,
+            ),
+            g.bytes,
+            nomePastaDrive(g.caminhoRel ?? ''),
+            path: g.caminho,
+            caminhoRel: g.caminhoRel ?? '',
+          )
+      ];
+      _ev('Galeria nativa: ${items.length} itens em ${cron.elapsedMilliseconds} ms (photo_manager conta $count)');
+      await _terminarCarga(items);
+      return;
+    }
+    _ev('Galeria nativa recusada (${nativa?.length ?? 'erro'} de $count): paginando pelo photo_manager');
+
     // Consulta nativa em paralelo com a paginação (roda em thread própria).
     final infoFut = Nativo.midias();
 
@@ -86,13 +120,22 @@ extension _Galeria on _HomePageState {
     }
 
     final midiaInfo = await infoFut;
-    final cacheFallback = await _store.tamanhos();
     for (final it in items) {
       final info = midiaInfo[it.id];
       if (info != null) {
         if (info.bytes > 0) it.bytes = info.bytes;
         it.path = info.caminho;
       }
+    }
+    _ev('Galeria paginada: ${items.length} itens em ${cron.elapsedMilliseconds} ms');
+    await _terminarCarga(items);
+  }
+
+  /// Fecha a carga da galeria (dos 2 caminhos): tamanho do cache pra quem
+  /// veio sem, pastas, totais e retomada.
+  Future<void> _terminarCarga(List<MediaItem> items) async {
+    final cacheFallback = await _store.tamanhos();
+    for (final it in items) {
       if (it.bytes == 0) {
         final c = cacheFallback[it.id];
         if (c != null) it.bytes = c;

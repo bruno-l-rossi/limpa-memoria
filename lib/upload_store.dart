@@ -452,6 +452,10 @@ class UploadStore {
   static const kLixeira = 'apagar_pra_lixeira_v1'; // rodada 18
   static const kDicaAberto = 'dica_app_aberto_v1'; // rodada 18
   static const kTema = 'tema_v1'; // 'sistema' | 'claro' | 'escuro'
+  // Rodada 19 (F4): motor nativo (sobe com o app fechado) e até onde o app já
+  // leu o resultados.jsonl dele.
+  static const kMotorFechado = 'motor_app_fechado_v1';
+  static const kOffsetNativo = 'motor_nativo_offset_v1';
 
   Future<String?> texto(String chave) async {
     final p = await SharedPreferences.getInstance();

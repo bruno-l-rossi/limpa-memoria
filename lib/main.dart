@@ -22,6 +22,7 @@ import 'pastas.dart';
 import 'manutencao_drive.dart';
 import 'selecao.dart';
 import 'diario.dart';
+import 'motor_nativo.dart';
 
 part 'app_midia.dart';
 part 'app_paginas.dart';
@@ -29,11 +30,12 @@ part 'app_tema.dart';
 part 'home_drive.dart';
 part 'home_galeria.dart';
 part 'home_motor.dart';
+part 'home_nativo.dart';
 part 'home_telas.dart';
 
 void main() => runApp(const MyApp());
 
-const String _versao = '1.6.0';
+const String _versao = '1.7.0';
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
@@ -79,7 +81,7 @@ const int _minRetomavel = 64 * 1024 * 1024;
 const int _maxRetomavelJuntos = 2;
 const _prefixoJa = 'ja-no-drive:';
 // Integridade: MD5 conferido até este tamanho (acima disso, vale o tamanho).
-const int _tetoMd5 = 256 * 1024 * 1024;
+const int _tetoMd5 = 4 * 1024 * 1024 * 1024; // A-08 (rodada 19): era 256 MB
 const int _pequeno = 8 * 1024 * 1024;
 
 class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
@@ -147,6 +149,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _lixeira = false; // rodada 18: apagar manda pra lixeira (30 dias)
   int _sdk = 0; // versão do Android (a lixeira só existe no 11+, API 30)
   bool _dicaAbertoVista = true; // dica "app aberto na tomada" dispensada
+  // Rodada 19 (F4): motor nativo, que sobe com o app fechado (home_nativo).
+  bool _motorFechado = false; // ajuste "Subir com o app fechado"
+  bool _nativoRecusado = false; // não deu nesta sessão: segue no antigo
+  bool _nativoAutorizado = false; // Google liberou o token sem tela
+  bool _emPrimeiroPlano = true; // o UIDT só liga com o app na tela
+  ArquivosMotor? _arqMotor;
+  final Map<String, ItemNativo> _noNativo = {}; // entregues ao motor nativo
+  EstadoNativo? _estadoNativo;
+  int _offsetNativo = 0;
+  bool _offsetNativoLido = false;
+  bool _importandoNativo = false;
+  DateTime? _semVidaDesde;
+  Timer? _pollNativo;
   StreamSubscription<TaskUpdate>? _sub;
 
   final ListQueue<ItemBackup> _pendentes = ListQueue(); // não enfileirados
@@ -243,6 +258,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _boot();
     _poll = Timer.periodic(const Duration(seconds: 15), (_) => _tick());
+    // Motor do app fechado: lê o progresso dele a cada 3 s com o app aberto.
+    _pollNativo = Timer.periodic(const Duration(seconds: 3), (_) {
+      if (_noNativo.isNotEmpty) _importarNativo();
+    });
   }
 
   /// Decide entre onboarding e o app. O motor e a galeria só sobem depois que
@@ -252,7 +271,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     await _store.init(dir);
     registrarNoDiario = _ev; // falhas engolidas no motor vão pro diário
     _temaApp.value = await _store.texto(UploadStore.kTema) ?? 'sistema';
-    if (dir != null && dir.isNotEmpty) _retomavel = UploadRetomavel(dir);
+    if (dir != null && dir.isNotEmpty) {
+      _retomavel = UploadRetomavel(dir);
+      _arqMotor = ArquivosMotor(dir);
+    }
     _enviadosIds = await _store.enviados();
     _mudou();
     final viu = await _store.viuOnboarding();
@@ -278,6 +300,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _poll?.cancel();
+    _pollNativo?.cancel();
     _refreshTimer?.cancel();
     _timerRede?.cancel();
     _sub?.cancel();
@@ -290,8 +313,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.inactive ||
         state == AppLifecycleState.detached) {
+      _emPrimeiroPlano = false;
       _store.gravarAgora();
     } else if (state == AppLifecycleState.resumed) {
+      _emPrimeiroPlano = true;
       _tick(); // voltou pro app: sincroniza na hora
     }
   }

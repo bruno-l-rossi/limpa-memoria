@@ -18,6 +18,7 @@ import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import com.google.android.gms.auth.api.identity.Identity
 import java.io.File
 import java.io.FileInputStream
 import java.security.MessageDigest
@@ -43,6 +44,10 @@ class MainActivity : FlutterActivity() {
     private val canalNotif = "backup_progresso"
     private val idNotif = 4242
     private val main = Handler(Looper.getMainLooper())
+    // Rodada 19: autorização do Google pro motor nativo esperando a tela de
+    // confirmação (quando o Google pede).
+    private var autorizacaoPendente: MethodChannel.Result? = null
+    private val reqAutorizacao = 7301
 
     companion object {
         // Consulta ao MediaStore: 1 thread basta (é uma consulta por vez).
@@ -56,6 +61,25 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, canal)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
+                    // Rodada 19 (A-15): a galeria inteira numa consulta só.
+                    "galeria" -> {
+                        ioPool.execute {
+                            val r = try { consultarGaleria() } catch (_: Exception) { null }
+                            main.post { result.success(r) }
+                        }
+                    }
+                    // Rodada 19 (F4): motor nativo, que sobe com o app fechado.
+                    "motorAutorizar" -> autorizar(call.argument<String>("email") ?: "", result)
+                    "motorIniciar" -> result.success(MotorNativo.iniciar(
+                        applicationContext,
+                        call.argument<String>("email") ?: "",
+                        call.argument<Boolean>("soWifi") ?: false,
+                        (call.argument<Number>("bytes") ?: 0).toLong()))
+                    "motorParar" -> {
+                        MotorNativo.pararTudo(applicationContext)
+                        result.success(true)
+                    }
+                    "motorRodando" -> result.success(MotorNativo.estaRodando())
                     "midias" -> {
                         ioPool.execute {
                             val r = consultarMidias()
@@ -136,6 +160,112 @@ class MainActivity : FlutterActivity() {
             "sizes" to sizes.toLongArray(),
             "paths" to paths,
         )
+    }
+
+    /// Galeria inteira (rodada 19, A-15): os mesmos campos que o photo_manager
+    /// lê, em arrays paralelos. Mesma regra de data do photo_manager (data da
+    /// foto no Android 10+, senão a data em que entrou na galeria).
+    private fun consultarGaleria(): HashMap<String, Any> {
+        val q = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+        val col = mutableListOf("_id", "_size", "_data", "_display_name", "media_type",
+            "date_added", "date_modified", "duration", "width", "height", "orientation",
+            "mime_type")
+        if (q) { col += "datetaken"; col += "relative_path" }
+        val ids = ArrayList<Long>(); val sizes = ArrayList<Long>(); val paths = ArrayList<String>()
+        val nomes = ArrayList<String>(); val tipos = ArrayList<Int>(); val datas = ArrayList<Long>()
+        val mods = ArrayList<Long>(); val durs = ArrayList<Int>(); val largs = ArrayList<Int>()
+        val alts = ArrayList<Int>(); val oris = ArrayList<Int>(); val rels = ArrayList<String>()
+        val mimes = ArrayList<String>()
+        contentResolver.query(
+            MediaStore.Files.getContentUri("external"), col.toTypedArray(),
+            "media_type IN (?, ?) AND bucket_id IS NOT NULL",
+            arrayOf(MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString(),
+                MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString()),
+            "_id DESC"
+        )?.use { c ->
+            fun i(n: String) = c.getColumnIndex(n)
+            val iId = i("_id"); val iSize = i("_size"); val iData = i("_data")
+            val iNome = i("_display_name"); val iTipo = i("media_type")
+            val iAdd = i("date_added"); val iMod = i("date_modified"); val iDur = i("duration")
+            val iW = i("width"); val iH = i("height"); val iOri = i("orientation")
+            val iMime = i("mime_type"); val iTaken = i("datetaken"); val iRel = i("relative_path")
+            while (c.moveToNext()) {
+                val tipoMs = c.getInt(iTipo)
+                ids += c.getLong(iId)
+                sizes += if (c.isNull(iSize)) 0L else c.getLong(iSize)
+                paths += c.getString(iData) ?: ""
+                nomes += c.getString(iNome) ?: ""
+                tipos += if (tipoMs == MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO) 2 else 1
+                var data = c.getLong(iAdd)
+                if (q && iTaken >= 0 && !c.isNull(iTaken)) {
+                    val t = c.getLong(iTaken) / 1000
+                    if (t != 0L) data = t
+                }
+                datas += data
+                mods += c.getLong(iMod)
+                durs += if (tipoMs == MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO && iDur >= 0)
+                    (c.getLong(iDur) / 1000).toInt() else 0
+                largs += if (iW >= 0) c.getInt(iW) else 0
+                alts += if (iH >= 0) c.getInt(iH) else 0
+                oris += if (iOri >= 0) c.getInt(iOri) else 0
+                rels += if (iRel >= 0) (c.getString(iRel) ?: "") else ""
+                mimes += if (iMime >= 0) (c.getString(iMime) ?: "") else ""
+            }
+        }
+        return hashMapOf(
+            "ids" to ids.toLongArray(), "sizes" to sizes.toLongArray(), "paths" to paths,
+            "nomes" to nomes, "tipos" to tipos.toIntArray(), "datas" to datas.toLongArray(),
+            "mods" to mods.toLongArray(), "durs" to durs.toIntArray(), "largs" to largs.toIntArray(),
+            "alts" to alts.toIntArray(), "oris" to oris.toIntArray(), "rels" to rels,
+            "mimes" to mimes, "q" to q,
+        )
+    }
+
+    /// Autoriza o Drive pro motor nativo. Se o Google pedir confirmação, abre
+    /// a tela dele (por isso só roda com o app aberto) e responde depois.
+    private fun autorizar(email: String, result: MethodChannel.Result) {
+        try {
+            Identity.getAuthorizationClient(this).authorize(MotorNativo.pedido(email))
+                .addOnSuccessListener { r ->
+                    val pi = r.pendingIntent
+                    if (r.hasResolution() && pi != null) {
+                        autorizacaoPendente?.success(false)
+                        autorizacaoPendente = result
+                        try {
+                            startIntentSenderForResult(pi.intentSender, reqAutorizacao, null, 0, 0, 0)
+                        } catch (e: Exception) {
+                            MotorNativo.registrar(this, "abrir autorização: $e")
+                            autorizacaoPendente = null
+                            result.success(false)
+                        }
+                    } else {
+                        result.success(r.accessToken != null)
+                    }
+                }
+                .addOnFailureListener { e ->
+                    MotorNativo.registrar(this, "autorizar: $e")
+                    result.success(false)
+                }
+        } catch (e: Exception) {
+            MotorNativo.registrar(this, "autorizar: $e")
+            result.success(false)
+        }
+    }
+
+    @Deprecated("API de resultado antiga; a da autorização do Google ainda usa")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != reqAutorizacao) return
+        val r = autorizacaoPendente ?: return
+        autorizacaoPendente = null
+        try {
+            val res = Identity.getAuthorizationClient(this).getAuthorizationResultFromIntent(data)
+            r.success(res.accessToken != null)
+        } catch (e: Exception) {
+            MotorNativo.registrar(this, "resultado da autorização: $e")
+            r.success(false)
+        }
     }
 
     /// MD5 de um arquivo fora da thread principal.

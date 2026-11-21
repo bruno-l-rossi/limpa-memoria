@@ -33,6 +33,16 @@
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:foregroundServiceType="dataSync"
             android:exported="false" />
+        <!-- Rodada 19 (F4): motor nativo do backup. UIDT no Android 14+;
+             serviço em primeiro plano (dataSync) abaixo disso. -->
+        <service
+            android:name=".MotorJobService"
+            android:permission="android.permission.BIND_JOB_SERVICE"
+            android:exported="false" />
+        <service
+            android:name=".MotorService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

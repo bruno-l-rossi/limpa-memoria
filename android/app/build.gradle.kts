@@ -63,3 +63,10 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+dependencies {
+    // Rodada 19 (F4): token do Drive sem tela pro motor nativo (Authorization
+    // API). Mesma versão que o google_sign_in_android já traz.
+    implementation("com.google.android.gms:play-services-auth:21.0.0")
+    testImplementation("junit:junit:4.13.2")
+}

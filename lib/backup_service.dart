@@ -477,6 +477,10 @@ class BackupService {
     }
   }
 
+  /// Id da subpasta já resolvida (depois de garantirSubpastas). Rodada 19: o
+  /// motor nativo recebe o id pronto e não precisa saber de pastas.
+  static String? idSubpasta(String nome) => _subCache[nome];
+
   /// Id da subpasta SE ela já existe (não cria). Rodada 18: procurar na pasta
   /// de nome antigo sem criar pasta vazia no Drive.
   static Future<String?> _subpastaExistente(

@@ -83,6 +83,7 @@ extension _Telas on _HomePageState {
       'Sessão: ${_milhar(_cFeitos)} de ${_milhar(_bgTotal)} · ${_fmt(_cBytesFeitos)} de ${_fmt(_cBytesTotal)}',
       'Fila: ${_milhar(_pendentes.length)} · no Android: ${_emAndamento.length} · preparando: ${_preparando.length} · conferindo: ${_processando.length} · em partes: ${_emRetomavel.length}',
       'Motor novo: ${_motorNovo ? 'ligado' : 'desligado'} · transferência longa: ${_transferenciaLonga ? 'ligada' : 'desligada'}',
+      'App fechado: ${_motorFechado ? (_nativoRecusado ? 'recusado nesta sessão' : 'ligado') : 'desligado'} · com ele: ${_milhar(_noNativo.length)} · ${_estadoNativo == null ? 'sem estado' : '${_estadoNativo!.vivo(DateTime.now()) ? 'rodando' : 'parado'}, ${_milhar(_estadoNativo!.feitos)} de ${_milhar(_estadoNativo!.total)}${_estadoNativo!.precisaLogin ? ', precisa confirmar a conta' : ''}${_estadoNativo!.ultimoErro.isNotEmpty ? ', último erro: ${_estadoNativo!.ultimoErro}' : ''}'}',
       'Falhos: ${_falhos.length} · pausado: ${_pausado ? 'sim' : 'não'}${_driveCheio ? ' (Drive cheio)' : ''} · sem rede: ${_semRede ? 'sim' : 'não'}',
       'Nesta execução: ${_milhar(_arquivosSessao)} arquivos, ${_fmt(_bytesSessao)} · ${_fmt(_velocidade.round())}/s',
       'Bateria isenta: ${isenta ? 'sim' : 'NÃO'} · só wifi: ${_soWifi ? 'sim' : 'não'}',
@@ -398,6 +399,24 @@ extension _Telas on _HomePageState {
             await _store.setFlag(UploadStore.kMotorNovo, v);
             if (mounted) _set(() => _motorNovo = v);
           },
+          motorFechado: _motorFechado,
+          onMotorFechado: (v) async {
+            await _store.setFlag(UploadStore.kMotorFechado, v);
+            if (!mounted) return;
+            _set(() {
+              _motorFechado = v;
+              _nativoRecusado = false;
+            });
+            _ev('Subir com o app fechado: ${v ? 'ligado' : 'desligado'}');
+            if (!v && _noNativo.isNotEmpty) {
+              // Desligou no meio: o que estava com o motor nativo volta pro
+              // motor normal (o que já subiu fica).
+              final volta = [for (final e in _noNativo.values) e.item];
+              await _pararNativo();
+              if (!_pausado) _devolverNaFrente(volta);
+            }
+            _tick();
+          },
           lixeira: _lixeira,
           lixeiraDisponivel: _sdk >= 30,
           onLixeira: (v) async {
@@ -586,6 +605,15 @@ extension _Telas on _HomePageState {
     } else if (_semRede) {
       detalhe =
           'Sem internet ou o Drive pediu pausa. Continua sozinho quando voltar · na fila: ${_milhar(_pendentes.length)}';
+    } else if (_noNativo.isNotEmpty) {
+      // Rodada 19: motor do app fechado. Pode fechar o app.
+      final en = _estadoNativo;
+      final semRedeNativo = en?.semRede ?? false;
+      detalhe = semRedeNativo
+          ? 'Sem internet. Continua sozinho quando voltar, mesmo com o app fechado.'
+          : 'Subindo, pode fechar o app · faltam ${_milhar(_noNativo.length)}'
+              '${eta.isNotEmpty ? ' · $eta' : ''}'
+              '${vel > 0 ? ' · ${_fmt(vel.round())}/s' : ''}';
     } else {
       detalhe =
           'Subindo agora: ${_emAndamento.length + _preparando.length} · na fila: ${_milhar(_pendentes.length)}'
@@ -657,6 +685,7 @@ extension _Telas on _HomePageState {
               !_pausado &&
               !fimFalhas &&
               _conta != null &&
+              _noNativo.isEmpty && // com o motor do app fechado, não precisa
               !_dicaAbertoVista)
             Padding(
               padding: const EdgeInsets.only(top: 2),

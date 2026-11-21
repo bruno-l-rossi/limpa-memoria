@@ -2,10 +2,55 @@
 
 ## ESTADO DA EXECUÇÃO (atualizado 2026-11-20) — LEIA PRIMEIRO
 
-Branch `rodadas-12-a-17` (a partir de `main` 85efe74). Versão 1.6.0+7.
-**Rodada 18 (2026-11-20) compilada e testada na nuvem** (Flutter 3.50.1):
-`flutter analyze` sem nenhum aviso, 62 testes, APK debug e release. Ainda NÃO
-foi testado em aparelho: nada das rodadas 12 a 18 rodou num celular.
+Branch `rodadas-12-a-17` (a partir de `main` 85efe74). Versão 1.7.0+8.
+**Rodada 19 (2026-11-21) compilada e testada na nuvem** (Flutter 3.50.1):
+`flutter analyze` sem aviso, 70 testes Dart, 7 testes JUnit do Kotlin, APK
+debug e release. Ainda NÃO foi testado em aparelho: nada das rodadas 12 a 19
+rodou num celular. O Bruno decidiu testar tudo de uma vez, depois da 19.
+
+Feito na rodada 19:
+- F4 motor do app fechado (Ajustes > Em teste > "Subir com o app fechado",
+  desligado por padrão, flag `motor_app_fechado_v1`):
+  - Kotlin `MotorNativo.kt`: UIDT (`MotorJobService`, Android 14+) ou serviço
+    em primeiro plano dataSync (`MotorService`, abaixo do 14). 3 uploads por
+    vez, sessão retomável em blocos de 8 MiB (`Content-Range`), sessão salva
+    em `sessoes.json` (retoma depois de kill; sessão de até 6 dias), MD5 na
+    mesma leitura quando começa do zero, apaga e sobe de novo 1 vez se o MD5
+    não bater, espera rede sem gastar tentativa, Drive cheio para tudo.
+  - Token sem tela: Authorization API (`play-services-auth` 21.0.0, mesma do
+    google_sign_in_android). A 1ª vez pede confirmação com o app aberto
+    (`motorAutorizar`); depois renova sozinho a cada 40 min.
+  - Contrato por arquivos em `<dados>/motor/` (1 escritor cada): `fila.json`
+    (Dart), `resultados.jsonl`, `estado.json`, `sessoes.json`, `diario.log`
+    (Kotlin). Dart: `lib/motor_nativo.dart` (testado) e `lib/home_nativo.dart`.
+  - Integração: `_alimentar` entrega a fila toda ao motor; `_importarNativo`
+    (no tick de 15 s e a cada 3 s com o motor ligado) passa cada resultado
+    pelo mesmo `_confirmarEnvio`. Falha não definitiva volta pra fila (até 3);
+    motor parado há 30 s com itens entregues = devolve e entrega de novo.
+    Se o Google ou o Android recusar, a sessão segue no motor antigo e avisa.
+  - A-20: com o motor ligado, só a notificação dele (Dart não posta a sua; sem
+    background_downloader na jogada).
+  - Regras puras do Kotlin em `MotorUtil.kt` com JUnit
+    (`./gradlew :app:testDebugUnitTest`).
+- A-15: galeria pela consulta nativa `galeria` (mesmos campos e mesma regra
+  de data do photo_manager; `AssetEntity` montado direto). Se vier vazia ou
+  com menos de 90% do que o photo_manager conta, pagina como antes. O tempo
+  vai pro `eventos.log` ("Galeria nativa: N itens em X ms").
+- A-08: teto do MD5 de 256 MB pra 4 GB (Dart `_tetoMd5` e Kotlin `TETO_MD5`).
+- A-19 NÃO migrado pro google_sign_in 7, de propósito: no Android a 7 exige um
+  client ID web novo no Google Cloud (`serverClientId`); sem ele o login
+  quebra. O motor nativo já usa a API nova de autorização direto. Migrar o
+  login do app fica pra quando o Bruno criar esse client ID.
+
+Ordem de teste no aparelho da rodada 19 (antes da lista da 18):
+1. Abrir o app: o Diagnóstico deve ter "Galeria nativa: N itens em X ms".
+2. Ajustes > Em teste > ligar "Subir com o app fechado". Marcar umas 20
+   fotos e 1 vídeo grande, Subir. Na 1ª vez o Google pode pedir confirmação.
+3. Fechar o app (tirar dos recentes) e apagar a tela. Notificação única
+   "Backup: X de N". Reabrir depois: contagem certa, nuvem nos itens.
+4. No meio de um vídeo grande: modo avião 1 min e voltar. Tem que continuar
+   do ponto, sem recomeçar (Diagnóstico > velocidade, e o Drive sem cópia).
+5. 1 noite inteira com uns 20 GB, app fechado, na tomada.
 
 Decisões do Bruno (2026-11-20): app de uso próprio, sem Play Store. Pode
 renomear pastas no Drive, ter lixeira, botão de corrigir datas e modo escuro.
@@ -48,11 +93,7 @@ Feito na rodada 18:
   quebrava a compilação do photo_manager 3.12).
 - A-34 minify: nada a fazer, o Flutter já liga R8 no release.
 
-Continua NÃO feito (e por quê):
-- F4 inteira (motor sem o app aberto, google_sign_in 7, notificação única
-  A-19/A-20): depende do teste de 1 noite com Transferência longa.
-- A-08 teto de MD5 e A-15 galeria pela consulta nativa: precisam de medição
-  em aparelho antes.
+Continua NÃO feito na rodada 18 (a 19 fez F4, A-08, A-15 e A-20):
 - A-35 publicar consentimento OAuth: é no Google Cloud, com o Bruno.
 - Sugestão "Duplicatas exatas": fica de fora. Duplicata exata já sobe 1 vez
   só (MD5), e apagar cópia sem backup não é o papel do app.

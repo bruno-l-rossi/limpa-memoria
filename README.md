@@ -20,7 +20,7 @@ App Android que libera espaço no celular sem perder foto nem vídeo. Ele lista 
 - Toggle "só no wifi" (padrão: qualquer rede; no wifi economiza dados).
 - Reinstalou o app? Ele reconhece o backup anterior no Drive e não sobe nada em dobro.
 - Ícone de drive na pasta quando todos os arquivos dentro dela já subiram (parcial mostra quantos de quantos).
-- Integridade de verdade: em arquivos até 256 MB, o MD5 local é comparado com o que o Drive calculou; divergiu, o app apaga o corrompido da nuvem e refaz o upload sozinho.
+- Integridade de verdade: em arquivos até 4 GB, o MD5 local é comparado com o que o Drive calculou; divergiu, o app apaga o corrompido da nuvem e refaz o upload sozinho.
 - Apaga do celular só depois de CONFERIR no Drive, arquivo por arquivo (id + tamanho + MD5 pra quem ainda não tinha sido conferido por conteúdo). O que não conferir fica no celular; o que não estava no Drive de verdade volta pra lista do backup. Sem a permissão de localização das fotos, não apaga (o backup poderia ter ido sem o GPS). A exclusão roda em lotes com a confirmação do próprio Android e termina mostrando quanto espaço foi liberado.
 - Ajustes: só no wifi, economia de bateria, aparência (automático, claro ou escuro), apagar pra lixeira do celular (Android 11+, 30 dias pra desfazer), organizar pastas no Drive, corrigir datas no Drive, histórico de backups, espaço no Drive, recarregar galeria, diagnóstico e dois modos em teste (transferência longa do Android 14+ e motor novo em partes).
 - Organizar pastas no Drive: move o que subiu antes da rodada 18 pra pasta de nome novo. Corrigir datas: troca a data dos backups antigos (que ficaram com a data do envio) pela data da foto ou do vídeo.
@@ -40,9 +40,11 @@ A contagem é guiada pelo banco da própria biblioteca, não pelo evento ao vivo
 
 ## Desempenho em abertura
 
-Uma consulta só ao MediaStore (canal nativo) devolve tamanho e caminho de todas as mídias em menos de 1 segundo, mesmo com 19 mil arquivos. A galeria carrega paginada, então a primeira tela aparece em segundos.
+Uma consulta só ao MediaStore (canal nativo `galeria`) devolve a galeria inteira, com nome, data, tipo, pasta, tamanho e caminho, e o app monta os itens direto dela, sem paginar pelo photo_manager. Se a consulta falhar ou vier incompleta, o app volta pro caminho antigo (paginado). O tempo de carga fica no Diagnóstico.
 
 ## Modos em teste (Ajustes > Em teste)
+
+- **Subir com o app fechado** (rodada 19): o backup roda num motor nativo em Kotlin (`MotorNativo.kt`), como trabalho iniciado pelo usuário no Android 14+ (sem o teto de 6 h) ou serviço em primeiro plano abaixo disso. Continua com o app fechado e a tela apagada, sobe em blocos de 8 MB retomando de onde parou (até depois de o processo morrer), confere o MD5 e mostra uma notificação só. O token do Drive vem da API de autorização do Google, sem tela; só a primeira vez pede confirmação com o app aberto. Com ele ligado, os 2 modos abaixo não fazem diferença.
 
 - **Transferência longa (Android 14+)**: usa o modo UIDT do Android (job iniciado pelo usuário), feito pra envios grandes e sem o teto de 6 h por dia do serviço `dataSync` em apps que miram Android 15+. Se o Android recusar (ex.: app fora da tela), a biblioteca volta sozinha pro modo normal.
 - **Motor novo**: arquivos de 64 MB pra cima sobem em partes de 16 MB pelo próprio app, com a sessão do Drive salva em disco. Rede caiu, app fechou ou Parar: na volta pergunta ao Drive quanto chegou e continua dali, em vez de recomeçar o vídeo do zero. Enquanto em teste, só anda com o app aberto.
@@ -55,12 +57,14 @@ Uma consulta só ao MediaStore (canal nativo) devolve tamanho e caminho de todas
 
     flutter test
 
-Cobrem as regras que protegem contra perda (duplicata, conferência antes de apagar, leitura do enviados.jsonl), o nome novo das pastas e a compatibilidade com o antigo, o plano de mover pastas e corrigir datas no Drive, a seleção, a montagem do backup, as sugestões, as mensagens e o upload em partes. O GitHub Actions roda `flutter analyze` e `flutter test` a cada push.
+Os testes do Kotlin (regras do motor nativo) rodam com `cd android && ./gradlew :app:testDebugUnitTest`.
+
+Os testes do Dart cobrem as regras que protegem contra perda (duplicata, conferência antes de apagar, leitura do enviados.jsonl), o nome novo das pastas e a compatibilidade com o antigo, o plano de mover pastas e corrigir datas no Drive, a seleção, o contrato de arquivos com o motor nativo, a galeria nativa, a montagem do backup, as sugestões, as mensagens e o upload em partes. O GitHub Actions roda `flutter analyze` e `flutter test` a cada push.
 
 ## Limites conhecidos
 
 - O background_downloader não pausa um upload no meio. O "parar" cancela a fila do Android; um arquivo cortado no meio recomeça do zero (exceto no motor novo, que continua de onde parou).
-- Com o app fechado, sobem só os arquivos que já estavam na fila do motor. Pra um backup de 100 GB ir até o fim sem toque, deixe o app aberto na tomada (o banner dá essa dica até você tocar em Entendi).
+- Sem o modo "Subir com o app fechado", só sobem com o app fechado os arquivos que já estavam na fila do motor. Pra um backup de 100 GB ir até o fim sem toque, deixe o app aberto na tomada (o banner dá essa dica até você tocar em Entendi).
 - Organizar pastas só alcança o que ainda está no celular. Arquivos que já foram apagados do celular ficam na pasta antiga (ex.: "Sent"), porque o app não tem mais como saber de onde vieram.
 - Corrigir datas troca a data de modificação no Drive. A data de criação o Drive não deixa mudar depois que o arquivo existe.
 - Durante o backup aparecem 2 notificações: a fixa do serviço (obrigatória, é o que tira o teto de 9 min do Android) e a de progresso com o número real, atualizada pelo app. Com o app morto, a de progresso congela; a do serviço continua.

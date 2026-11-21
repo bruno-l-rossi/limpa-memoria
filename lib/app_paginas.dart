@@ -242,6 +242,8 @@ class AjustesPage extends StatefulWidget {
   final VoidCallback onDiagnostico;
   final VoidCallback onHistorico;
   final bool motorNovo;
+  final bool motorFechado;
+  final Future<void> Function(bool) onMotorFechado;
   final Future<void> Function(bool) onMotorNovo;
   final bool transferenciaLonga;
   final Future<void> Function(bool) onTransferenciaLonga;
@@ -260,6 +262,8 @@ class AjustesPage extends StatefulWidget {
     required this.onDiagnostico,
     required this.onHistorico,
     required this.motorNovo,
+    required this.motorFechado,
+    required this.onMotorFechado,
     required this.onMotorNovo,
     required this.transferenciaLonga,
     required this.onTransferenciaLonga,
@@ -277,6 +281,7 @@ class AjustesPage extends StatefulWidget {
 class _AjustesPageState extends State<AjustesPage> {
   late bool _soWifi = widget.soWifi;
   late bool _motorNovo = widget.motorNovo;
+  late bool _motorFechado = widget.motorFechado;
   late bool _transfLonga = widget.transferenciaLonga;
   late bool _lixeira = widget.lixeira;
   bool? _bateria;
@@ -406,6 +411,16 @@ class _AjustesPageState extends State<AjustesPage> {
             padding: EdgeInsets.fromLTRB(16, 8, 16, 0),
             child: Text('Em teste',
                 style: TextStyle(color: _inkMuted, fontSize: 12)),
+          ),
+          SwitchListTile(
+            value: _motorFechado,
+            title: const Text('Subir com o app fechado'),
+            subtitle: const Text(
+                'O backup roda num motor do próprio Android: continua com o app fechado e a tela apagada, sobe vídeo grande em partes e retoma de onde parou. Com ele ligado, os 2 de baixo não fazem diferença.'),
+            onChanged: (v) async {
+              setState(() => _motorFechado = v);
+              await widget.onMotorFechado(v);
+            },
           ),
           SwitchListTile(
             value: _transfLonga,
