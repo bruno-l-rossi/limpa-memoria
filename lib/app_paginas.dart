@@ -241,12 +241,8 @@ class AjustesPage extends StatefulWidget {
   final VoidCallback onRecarregar;
   final VoidCallback onDiagnostico;
   final VoidCallback onHistorico;
-  final bool motorNovo;
   final bool motorFechado;
   final Future<void> Function(bool) onMotorFechado;
-  final Future<void> Function(bool) onMotorNovo;
-  final bool transferenciaLonga;
-  final Future<void> Function(bool) onTransferenciaLonga;
   final bool lixeira;
   final bool lixeiraDisponivel;
   final Future<void> Function(bool) onLixeira;
@@ -261,12 +257,8 @@ class AjustesPage extends StatefulWidget {
     required this.onRecarregar,
     required this.onDiagnostico,
     required this.onHistorico,
-    required this.motorNovo,
     required this.motorFechado,
     required this.onMotorFechado,
-    required this.onMotorNovo,
-    required this.transferenciaLonga,
-    required this.onTransferenciaLonga,
     required this.lixeira,
     required this.lixeiraDisponivel,
     required this.onLixeira,
@@ -280,9 +272,7 @@ class AjustesPage extends StatefulWidget {
 }
 class _AjustesPageState extends State<AjustesPage> {
   late bool _soWifi = widget.soWifi;
-  late bool _motorNovo = widget.motorNovo;
   late bool _motorFechado = widget.motorFechado;
-  late bool _transfLonga = widget.transferenciaLonga;
   late bool _lixeira = widget.lixeira;
   bool? _bateria;
 
@@ -407,39 +397,14 @@ class _AjustesPageState extends State<AjustesPage> {
             onTap: widget.onDiagnostico,
           ),
           const Divider(),
-          Padding(
-            padding: EdgeInsets.fromLTRB(16, 8, 16, 0),
-            child: Text('Em teste',
-                style: TextStyle(color: _inkMuted, fontSize: 12)),
-          ),
           SwitchListTile(
             value: _motorFechado,
             title: const Text('Subir com o app fechado'),
             subtitle: const Text(
-                'O backup roda num motor do próprio Android: continua com o app fechado e a tela apagada, sobe vídeo grande em partes e retoma de onde parou. Com ele ligado, os 2 de baixo não fazem diferença.'),
+                'Ligado: o backup continua com o app fechado e a tela apagada, sobe vídeo grande em partes e retoma de onde parou. Desligue só se der problema: aí ele sobe pelo motor antigo, com o app aberto.'),
             onChanged: (v) async {
               setState(() => _motorFechado = v);
               await widget.onMotorFechado(v);
-            },
-          ),
-          SwitchListTile(
-            value: _transfLonga,
-            title: const Text('Transferência longa (Android 14+)'),
-            subtitle: const Text(
-                'Usa o modo do Android feito pra envios grandes. Pode ajudar backups de madrugada a não pararem.'),
-            onChanged: (v) async {
-              setState(() => _transfLonga = v);
-              await widget.onTransferenciaLonga(v);
-            },
-          ),
-          SwitchListTile(
-            value: _motorNovo,
-            title: const Text('Motor novo (experimental)'),
-            subtitle: const Text(
-                'Envia vídeos em partes e continua de onde parou se a rede cair. Use só pra teste.'),
-            onChanged: (v) async {
-              setState(() => _motorNovo = v);
-              await widget.onMotorNovo(v);
             },
           ),
           Padding(

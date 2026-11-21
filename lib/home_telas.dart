@@ -81,8 +81,7 @@ extension _Telas on _HomePageState {
       'Galeria: ${_milhar(_items.length)} itens · acesso ${_acessoTotal ? 'total' : (_acessoParcial ? 'PARCIAL' : 'negado')}',
       'Enviados no store: ${_milhar(_enviadosIds.length)}',
       'Sessão: ${_milhar(_cFeitos)} de ${_milhar(_bgTotal)} · ${_fmt(_cBytesFeitos)} de ${_fmt(_cBytesTotal)}',
-      'Fila: ${_milhar(_pendentes.length)} · no Android: ${_emAndamento.length} · preparando: ${_preparando.length} · conferindo: ${_processando.length} · em partes: ${_emRetomavel.length}',
-      'Motor novo: ${_motorNovo ? 'ligado' : 'desligado'} · transferência longa: ${_transferenciaLonga ? 'ligada' : 'desligada'}',
+      'Fila: ${_milhar(_pendentes.length)} · no Android: ${_emAndamento.length} · preparando: ${_preparando.length} · conferindo: ${_processando.length}',
       'App fechado: ${_motorFechado ? (_nativoRecusado ? 'recusado nesta sessão' : 'ligado') : 'desligado'} · com ele: ${_milhar(_noNativo.length)} · ${_estadoNativo == null ? 'sem estado' : '${_estadoNativo!.vivo(DateTime.now()) ? 'rodando' : 'parado'}, ${_milhar(_estadoNativo!.feitos)} de ${_milhar(_estadoNativo!.total)}${_estadoNativo!.precisaLogin ? ', precisa confirmar a conta' : ''}${_estadoNativo!.ultimoErro.isNotEmpty ? ', último erro: ${_estadoNativo!.ultimoErro}' : ''}'}',
       'Falhos: ${_falhos.length} · pausado: ${_pausado ? 'sim' : 'não'}${_driveCheio ? ' (Drive cheio)' : ''} · sem rede: ${_semRede ? 'sim' : 'não'}',
       'Nesta execução: ${_milhar(_arquivosSessao)} arquivos, ${_fmt(_bytesSessao)} · ${_fmt(_velocidade.round())}/s',
@@ -390,16 +389,6 @@ extension _Telas on _HomePageState {
           onRecarregar: _recarregarGaleria,
           onDiagnostico: _abrirDiagnostico,
           onHistorico: _abrirHistorico,
-          motorNovo: _motorNovo,
-          transferenciaLonga: _transferenciaLonga,
-          onTransferenciaLonga: (v) async {
-            await _store.setFlag(UploadStore.kTransferenciaLonga, v);
-            if (mounted) _set(() => _transferenciaLonga = v);
-          },
-          onMotorNovo: (v) async {
-            await _store.setFlag(UploadStore.kMotorNovo, v);
-            if (mounted) _set(() => _motorNovo = v);
-          },
           motorFechado: _motorFechado,
           onMotorFechado: (v) async {
             await _store.setFlag(UploadStore.kMotorFechado, v);

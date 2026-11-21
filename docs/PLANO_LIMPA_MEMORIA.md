@@ -2,10 +2,25 @@
 
 ## ESTADO DA EXECUÇÃO (atualizado 2026-11-20) — LEIA PRIMEIRO
 
-Branch `rodadas-12-a-17` (a partir de `main` 85efe74). Versão 1.8.0+9.
-**Rodada 20 (2026-11-21) compilada e testada na nuvem** (Flutter 3.50.1):
-`flutter analyze` sem aviso, 71 testes Dart, 10 testes JUnit, APK release.
-Ainda NÃO foi testado em aparelho (nada das rodadas 12 a 20).
+Branch `rodadas-12-a-17` (a partir de `main` 85efe74). Versão 1.9.0+10.
+**Rodada 21 (2026-11-21) compilada e testada na nuvem** (Flutter 3.50.1):
+`flutter analyze` sem aviso, 66 testes Dart, 10 testes JUnit, APK release.
+Ainda NÃO foi testado em aparelho (nada das rodadas 12 a 21).
+
+Feito na rodada 21 (T4.5 parcial, decisão do Bruno em 2026-11-21: "novo por
+padrão, antigo de reserva"):
+- "Subir com o app fechado" ligado por padrão (flag nova
+  `motor_app_fechado_v2`, `UploadStore.flagOu`), fora da seção "Em teste".
+- O motor antigo (background_downloader, janela, reconciliação, órfãos)
+  ficou como reserva: entra se o Google/Android recusar o nativo
+  (`_recusarNativo`) ou se a pessoa desligar o ajuste.
+- Saíram os 2 modos de teste antigos: "Motor novo" do Dart
+  (`lib/upload_retomavel.dart`, o teste dele, `_enviarRetomavel`,
+  `_emRetomavel`, `BackupService.criarSessaoPara`) e "Transferência longa"
+  (prioridade 0/UIDT do background_downloader). Flags `motor_nativo_v1` e
+  `uidt_v1` ficam órfãs nas preferências, sem efeito.
+- Falta da T4.5: remover o motor de reserva inteiro. Só depois de o motor do
+  app fechado passar no teste do aparelho.
 
 Feito na rodada 20 (motor do app fechado):
 - A-13a: arquivo até 5 MB sobe num pedido só (multipart), metade das idas

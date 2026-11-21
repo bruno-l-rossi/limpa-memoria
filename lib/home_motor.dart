@@ -114,7 +114,6 @@ extension _MotorBackup on _HomePageState {
       _emAndamento.isNotEmpty ||
       _preparando.isNotEmpty ||
       _processando.isNotEmpty ||
-      _emRetomavel.isNotEmpty ||
       _alimentando;
   /// A sessão parou de andar com arquivos que não subiram (falharam de vez).
   bool get _fimComFalhas =>
@@ -285,7 +284,6 @@ extension _MotorBackup on _HomePageState {
           _naFila.contains(id) ||
           _preparando.contains(id) ||
           _processando.contains(id) ||
-          _emRetomavel.contains(id) ||
           _noNativo.containsKey(id) ||
           _falhos.containsKey(id);
       if (ok) {
@@ -529,20 +527,7 @@ extension _MotorBackup on _HomePageState {
             _emAndamento.contains(item.id) ||
             _preparando.contains(item.id) ||
             _processando.contains(item.id) ||
-            _emRetomavel.contains(item.id) ||
             !_emFila.contains(item.id)) {
-          continue;
-        }
-        // Motor novo: arquivo grande sobe em partes, com retomada.
-        if (_motorNovo &&
-            _retomavel != null &&
-            item.bytes >= _minRetomavel &&
-            item.path.isNotEmpty &&
-            _emRetomavel.length < _maxRetomavelJuntos) {
-          _emRetomavel.add(item.id);
-          emVoo++;
-          bytesEmVoo += item.bytes;
-          unawaited(_enviarRetomavel(item));
           continue;
         }
         lote.add(item);
@@ -585,7 +570,7 @@ extension _MotorBackup on _HomePageState {
           }
           final t0 = DateTime.now();
           final (ok, erro) = await BackupService.enfileirarUm(_gsi, item,
-              soWifi: _soWifi, transferenciaLonga: _transferenciaLonga);
+              soWifi: _soWifi);
           _telemetria.preparo(DateTime.now().difference(t0));
           return (item: item, ok: ok, erro: erro);
         }));
@@ -680,82 +665,6 @@ extension _MotorBackup on _HomePageState {
     if (_alimentarDeNovo) {
       _alimentarDeNovo = false;
       unawaited(_alimentar());
-    }
-  }
-  /// Motor novo: sobe UM arquivo grande em partes. Rede caiu, app fechou,
-  /// Parar: a sessão fica salva e a próxima tentativa continua de onde parou.
-  Future<void> _enviarRetomavel(ItemBackup item) async {
-    final id = item.id;
-    _agendarRefresh();
-    try {
-      final t0 = DateTime.now();
-      final r = await _retomavel!.enviar(
-        id,
-        item.path,
-        criarSessao: () => BackupService.criarSessaoPara(_gsi, item),
-        cancelado: () => _pausado || _conta == null,
-      );
-      _telemetria.preparo(DateTime.now().difference(t0));
-      switch (r.fim) {
-        case FimUpload.ok:
-          String? motivo;
-          var verificou = false;
-          if (r.bytes != null && item.bytes > 0 && r.bytes != item.bytes) {
-            motivo = 'tamanho';
-          } else if (r.md5 != null && item.bytes <= _tetoMd5) {
-            final ml = await Nativo.md5(item.path);
-            if (ml != null && ml != r.md5) motivo = 'md5';
-            if (ml != null && ml == r.md5) verificou = true;
-          }
-          if (motivo != null) {
-            final fid = r.fileId;
-            if (fid != null) unawaited(BackupService.apagarNoDrive(_gsi, fid));
-            _corrompidos.add(id);
-            final t = (_tentativas[id] ?? 0) + 1;
-            _tentativas[id] = t;
-            _ev('Motor novo: chegou diferente ($motivo), tentativa $t: "${item.titulo}"');
-            if (t <= 3) {
-              _porNaFila(item, frente: true);
-            } else {
-              _falhos[id] = item;
-              _motivoFalha[id] = 'Chegou diferente no Drive 3 vezes';
-              _telemetria.falhasDefinitivas++;
-            }
-          } else {
-            _ev('Motor novo: subiu em partes "${item.titulo}" (${_fmt(item.bytes)})');
-            await _confirmarEnvio(id, r.fileId, r.bytes ?? item.bytes,
-                verificado: verificou);
-          }
-        case FimUpload.cancelado:
-          // Parar: a fila é refeita pelo Retomar; o que já foi fica salvo.
-          _ev('Motor novo: pausado no meio de "${item.titulo}", continua depois');
-        case FimUpload.rede:
-        case FimUpload.sessaoInvalida:
-          _telemetria.retentativasRede++;
-          _porNaFila(item, frente: true);
-          if (r.fim == FimUpload.rede) _esperarRede();
-        case FimUpload.erro:
-          final t = (_tentativas[id] ?? 0) + 1;
-          _tentativas[id] = t;
-          _ev('Motor novo: erro em "${item.titulo}": ${r.erro}');
-          if (t <= 3) {
-            _porNaFila(item);
-          } else {
-            _falhos[id] = item;
-            _motivoFalha[id] = mensagemAmigavel(r.erro);
-            _telemetria.falhasDefinitivas++;
-            _erroBg = r.erro;
-          }
-      }
-    } catch (e) {
-      _ev('Motor novo: exceção em "${item.titulo}": $e');
-      _porNaFila(item, frente: true);
-    } finally {
-      _emRetomavel.remove(id);
-      _mudou();
-      _agendarRefresh();
-      _verificarFim();
-      unawaited(_tick());
     }
   }
   /// Sem rede: espera crescente (15s, 30s, 1 min… até 5 min) antes de tentar
@@ -1247,9 +1156,9 @@ extension _MotorBackup on _HomePageState {
     final job = await _store.job();
     final pausado = await _store.pausado();
     final soWifi = await _store.soWifi();
-    final motorNovo = await _store.flag(UploadStore.kMotorNovo);
-    final motorFechado = await _store.flag(UploadStore.kMotorFechado);
-    final transfLonga = await _store.flag(UploadStore.kTransferenciaLonga);
+    // Rodada 21: o motor do app fechado é o padrão (desliga em Ajustes).
+    final motorFechado =
+        await _store.flagOu(UploadStore.kMotorFechado, padrao: true);
     final lixeira = await _store.flag(UploadStore.kLixeira);
     final dicaVista = await _store.flag(UploadStore.kDicaAberto);
     final sdk = await Nativo.sdk();
@@ -1260,9 +1169,7 @@ extension _MotorBackup on _HomePageState {
       _sdk = sdk;
       _pausado = pausado;
       _soWifi = soWifi;
-      _motorNovo = motorNovo;
       _motorFechado = motorFechado;
-      _transferenciaLonga = transfLonga;
       if (job.isNotEmpty) {
         _carregarSessao(job.map(ItemBackup.fromMap).toList());
         _inicioSessao ??= DateTime.now();

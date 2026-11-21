@@ -445,16 +445,16 @@ class UploadStore {
   }
 
   // Flags genéricas (rodada 13+).
-  static const kMotorNovo = 'motor_nativo_v1'; // F4: desligado por padrão
   static const kDicaPrevia = 'dica_previa_v2'; // v2: arrasto (rodada 18)
-  static const kTransferenciaLonga = 'uidt_v1'; // F3: UIDT, desligado por padrão
   static const kTotalLiberado = 'total_liberado_bytes';
   static const kLixeira = 'apagar_pra_lixeira_v1'; // rodada 18
   static const kDicaAberto = 'dica_app_aberto_v1'; // rodada 18
   static const kTema = 'tema_v1'; // 'sistema' | 'claro' | 'escuro'
   // Rodada 19 (F4): motor nativo (sobe com o app fechado) e até onde o app já
   // leu o resultados.jsonl dele.
-  static const kMotorFechado = 'motor_app_fechado_v1';
+  // v2 (rodada 21): padrão ligado. O v1 era desligado por padrão; quem
+  // ligou na 1.7/1.8 continua ligado.
+  static const kMotorFechado = 'motor_app_fechado_v2';
   static const kOffsetNativo = 'motor_nativo_offset_v1';
 
   Future<String?> texto(String chave) async {
@@ -465,6 +465,12 @@ class UploadStore {
   Future<void> setTexto(String chave, String v) async {
     final p = await SharedPreferences.getInstance();
     await p.setString(chave, v);
+  }
+
+  /// Como flag(), mas com valor padrão quando a pessoa nunca mexeu.
+  Future<bool> flagOu(String chave, {required bool padrao}) async {
+    final p = await SharedPreferences.getInstance();
+    return p.getBool(chave) ?? padrao;
   }
 
   Future<bool> flag(String chave) async {

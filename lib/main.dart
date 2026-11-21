@@ -17,7 +17,6 @@ import 'verificacao_apagar.dart';
 import 'telemetria.dart';
 import 'mensagens.dart';
 import 'sugestoes.dart';
-import 'upload_retomavel.dart';
 import 'pastas.dart';
 import 'manutencao_drive.dart';
 import 'selecao.dart';
@@ -35,7 +34,7 @@ part 'home_telas.dart';
 
 void main() => runApp(const MyApp());
 
-const String _versao = '1.8.0';
+const String _versao = '1.9.0';
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
@@ -77,8 +76,6 @@ const int _janelaMax = 80;
 const int _janelaMin = 8;
 const int _janelaBytes = 4 * 1024 * 1024 * 1024;
 const int _concorrenciaPreparo = 6;
-const int _minRetomavel = 64 * 1024 * 1024;
-const int _maxRetomavelJuntos = 2;
 const _prefixoJa = 'ja-no-drive:';
 // Integridade: MD5 conferido até este tamanho (acima disso, vale o tamanho).
 const int _tetoMd5 = 4 * 1024 * 1024 * 1024; // A-08 (rodada 19): era 256 MB
@@ -144,8 +141,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _pausado = false; // backup pausado (pelo usuário ou por Drive cheio)
   bool _driveCheio = false; // pausa automática por cota estourada
   bool _soWifi = false; // subir só no wifi (escolha do usuário)
-  bool _motorNovo = false; // F4: motor nativo retomável (experimental)
-  bool _transferenciaLonga = false; // F3: UIDT no Android 14+ (experimental)
   bool _lixeira = false; // rodada 18: apagar manda pra lixeira (30 dias)
   int _sdk = 0; // versão do Android (a lixeira só existe no 11+, API 30)
   bool _dicaAbertoVista = true; // dica "app aberto na tomada" dispensada
@@ -172,8 +167,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final Set<String> _processando = {}; // conclusão sendo conferida (MD5)
   // Motor novo (rodada 15, experimental): arquivos grandes sobem em partes
   // pelo próprio app, com retomada de onde parou.
-  UploadRetomavel? _retomavel;
-  final Set<String> _emRetomavel = {};
   final Map<String, int> _tentativas = {}; // re-tentativas por id
   final Map<String, int> _tentativasRede = {}; // quedas de rede por id
   final Set<String> _corrompidos = {}; // chegaram diferentes: nunca "achar"
@@ -273,7 +266,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     registrarNoDiario = _ev; // falhas engolidas no motor vão pro diário
     _temaApp.value = await _store.texto(UploadStore.kTema) ?? 'sistema';
     if (dir != null && dir.isNotEmpty) {
-      _retomavel = UploadRetomavel(dir);
       _arqMotor = ArquivosMotor(dir);
     }
     _enviadosIds = await _store.enviados();

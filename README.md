@@ -22,7 +22,7 @@ App Android que libera espaço no celular sem perder foto nem vídeo. Ele lista 
 - Ícone de drive na pasta quando todos os arquivos dentro dela já subiram (parcial mostra quantos de quantos).
 - Integridade de verdade: em arquivos até 4 GB, o MD5 local é comparado com o que o Drive calculou; divergiu, o app apaga o corrompido da nuvem e refaz o upload sozinho.
 - Apaga do celular só depois de CONFERIR no Drive, arquivo por arquivo (id + tamanho + MD5 pra quem ainda não tinha sido conferido por conteúdo). O que não conferir fica no celular; o que não estava no Drive de verdade volta pra lista do backup. Sem a permissão de localização das fotos, não apaga (o backup poderia ter ido sem o GPS). A exclusão roda em lotes com a confirmação do próprio Android e termina mostrando quanto espaço foi liberado.
-- Ajustes: só no wifi, economia de bateria, aparência (automático, claro ou escuro), apagar pra lixeira do celular (Android 11+, 30 dias pra desfazer), organizar pastas no Drive, corrigir datas no Drive, histórico de backups, espaço no Drive, recarregar galeria, diagnóstico e dois modos em teste (transferência longa do Android 14+ e motor novo em partes).
+- Ajustes: só no wifi, economia de bateria, aparência (automático, claro ou escuro), apagar pra lixeira do celular (Android 11+, 30 dias pra desfazer), organizar pastas no Drive, corrigir datas no Drive, histórico de backups, espaço no Drive, recarregar galeria, diagnóstico e "Subir com o app fechado" (ligado por padrão; desligado, usa o motor de reserva).
 - Organizar pastas no Drive: move o que subiu antes da rodada 18 pra pasta de nome novo. Corrigir datas: troca a data dos backups antigos (que ficaram com a data do envio) pela data da foto ou do vídeo.
 - Filtros por Fotos/Vídeos e Fora/No Drive; pastas abrem a própria grade; lista dos arquivos que não subiram com o motivo de cada um.
 
@@ -42,12 +42,10 @@ A contagem é guiada pelo banco da própria biblioteca, não pelo evento ao vivo
 
 Uma consulta só ao MediaStore (canal nativo `galeria`) devolve a galeria inteira, com nome, data, tipo, pasta, tamanho e caminho, e o app monta os itens direto dela, sem paginar pelo photo_manager. Se a consulta falhar ou vier incompleta, o app volta pro caminho antigo (paginado). O tempo de carga fica no Diagnóstico.
 
-## Modos em teste (Ajustes > Em teste)
+## Dois motores de backup
 
-- **Subir com o app fechado** (rodada 19): o backup roda num motor nativo em Kotlin (`MotorNativo.kt`), como trabalho iniciado pelo usuário no Android 14+ (sem o teto de 6 h) ou serviço em primeiro plano abaixo disso. Continua com o app fechado e a tela apagada, sobe em blocos de 8 MB retomando de onde parou (até depois de o processo morrer), confere o MD5 e mostra uma notificação só. O token do Drive vem da API de autorização do Google, sem tela; só a primeira vez pede confirmação com o app aberto. Com ele ligado, os 2 modos abaixo não fazem diferença.
-
-- **Transferência longa (Android 14+)**: usa o modo UIDT do Android (job iniciado pelo usuário), feito pra envios grandes e sem o teto de 6 h por dia do serviço `dataSync` em apps que miram Android 15+. Se o Android recusar (ex.: app fora da tela), a biblioteca volta sozinha pro modo normal.
-- **Motor novo**: arquivos de 64 MB pra cima sobem em partes de 16 MB pelo próprio app, com a sessão do Drive salva em disco. Rede caiu, app fechou ou Parar: na volta pergunta ao Drive quanto chegou e continua dali, em vez de recomeçar o vídeo do zero. Enquanto em teste, só anda com o app aberto.
+- **Motor do app fechado (padrão desde a 1.9.0)**: o backup roda num motor nativo em Kotlin (`MotorNativo.kt`), como trabalho iniciado pelo usuário no Android 14+ (sem o teto de 6 h) ou serviço em primeiro plano abaixo disso. Continua com o app fechado e a tela apagada, sobe foto pequena num pedido só e arquivo grande em blocos de 8 MB retomando de onde parou (até depois de o processo morrer), confere o MD5 e mostra uma notificação só. O token do Drive vem da API de autorização do Google, sem tela; só a primeira vez pede confirmação com o app aberto.
+- **Motor de reserva**: o antigo, pelo background_downloader, com janela deslizante e o app aberto. Entra sozinho se o Google ou o Android recusarem o motor do app fechado, ou se você desligar "Subir com o app fechado" em Ajustes.
 
 ## Organização do código
 
